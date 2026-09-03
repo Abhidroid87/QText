@@ -73,7 +73,9 @@ const RESOLVE_POLL_MS = 1000;
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+const supabase = supabaseUrl && supabaseAnonKey && /^https?:\/\//i.test(supabaseUrl)
+  ? createClient(supabaseUrl, supabaseAnonKey)
+  : null;
 
 // --- Iroh dynamic loader ----------------------------------------------------
 
@@ -169,6 +171,7 @@ async function publishTicket(pin: string, ticket: string, meta: TransferMeta): P
   try { localStorage.setItem(key, JSON.stringify(entry)); } catch { /* quota */ }
 
   try {
+    if (!supabase) return;
     await supabase.from('transfer_tickets').upsert({
       pin,
       ticket,
@@ -180,7 +183,7 @@ async function publishTicket(pin: string, ticket: string, meta: TransferMeta): P
 
   setTimeout(() => {
     try { localStorage.removeItem(key); } catch { /* gone */ }
-    void supabase.from('transfer_tickets').delete().eq('pin', pin);
+    if (supabase) void supabase.from('transfer_tickets').delete().eq('pin', pin);
   }, TICKET_TTL_MS);
 }
 
@@ -200,6 +203,7 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
 
   // Layer 2: Supabase (cross-device) — poll until row appears or timeout
   const deadline = Date.now() + RESOLVE_TIMEOUT_MS;
+  if (!supabase) return null;
   while (Date.now() < deadline) {
     try {
       const { data, error } = await supabase
@@ -221,7 +225,7 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
 
 async function deleteTicket(pin: string): Promise<void> {
   try { localStorage.removeItem(STORAGE_PREFIX + pin); } catch { /* gone */ }
-  try { await supabase.from('transfer_tickets').delete().eq('pin', pin); } catch { /* gone */ }
+  try { if (supabase) await supabase.from('transfer_tickets').delete().eq('pin', pin); } catch { /* gone */ }
 }
 
 // --- Simulation: in-memory file store ---------------------------------------
