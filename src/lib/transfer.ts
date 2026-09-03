@@ -69,13 +69,17 @@ const RESOLVE_TIMEOUT_MS = 15000;
 const RESOLVE_POLL_MS = 1000;
 
 // --- Supabase client --------------------------------------------------------
+//
+// The anon key is public-safe — it's designed to be exposed in the browser.
+// Row Level Security policies protect the data, not the key. We hardcode the
+// values as fallbacks so the app works even when .env is missing (e.g. when
+// built by GitHub Actions where .env is gitignored). Environment variables
+// take priority when available.
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://vzagkaawgkagkbyllufq.supabase.co';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ6YWdrYWF3Z2thZ2tieWxsdWZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg0MTc0NjksImV4cCI6MjEwMzk5MzQ2OX0.N1cdhY47TdkZpZ4T86Twl-LRiPQQesmswXFArpF47h8';
 
-const supabase = supabaseUrl && supabaseAnonKey && /^https?:\/\//i.test(supabaseUrl)
-  ? createClient(supabaseUrl, supabaseAnonKey)
-  : null;
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // --- Iroh dynamic loader ----------------------------------------------------
 
@@ -171,7 +175,6 @@ async function publishTicket(pin: string, ticket: string, meta: TransferMeta): P
   try { localStorage.setItem(key, JSON.stringify(entry)); } catch { /* quota */ }
 
   try {
-    if (!supabase) return;
     await supabase.from('transfer_tickets').upsert({
       pin,
       ticket,
@@ -183,7 +186,7 @@ async function publishTicket(pin: string, ticket: string, meta: TransferMeta): P
 
   setTimeout(() => {
     try { localStorage.removeItem(key); } catch { /* gone */ }
-    if (supabase) void supabase.from('transfer_tickets').delete().eq('pin', pin);
+    void supabase.from('transfer_tickets').delete().eq('pin', pin);
   }, TICKET_TTL_MS);
 }
 
@@ -203,7 +206,6 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
 
   // Layer 2: Supabase (cross-device) — poll until row appears or timeout
   const deadline = Date.now() + RESOLVE_TIMEOUT_MS;
-  if (!supabase) return null;
   while (Date.now() < deadline) {
     try {
       const { data, error } = await supabase
@@ -225,7 +227,7 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
 
 async function deleteTicket(pin: string): Promise<void> {
   try { localStorage.removeItem(STORAGE_PREFIX + pin); } catch { /* gone */ }
-  try { if (supabase) await supabase.from('transfer_tickets').delete().eq('pin', pin); } catch { /* gone */ }
+  try { await supabase.from('transfer_tickets').delete().eq('pin', pin); } catch { /* gone */ }
 }
 
 // --- Simulation: in-memory file store ---------------------------------------
