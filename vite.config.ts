@@ -4,7 +4,6 @@ import { fileURLToPath, URL } from 'node:url';
 
 // https://vite.dev/config/
 export default defineConfig({
-  base: '/QText/',
   plugins: [react()],
   resolve: {
     alias: {
@@ -15,6 +14,12 @@ export default defineConfig({
     exclude: ['@number0/iroh-browser'],
   },
   server: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+  preview: {
     headers: {
       'Cross-Origin-Opener-Policy': 'same-origin',
       'Cross-Origin-Embedder-Policy': 'require-corp',

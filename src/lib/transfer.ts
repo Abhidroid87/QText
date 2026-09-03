@@ -1,18 +1,18 @@
 /**
- * Serverless P2P transfer engine, built on the Iroh browser WASM runtime.
+ * Serverless P2P transfer engine for Meshdrop.
  *
- * Architecture:
- *   1. Sender boots an Iroh Endpoint, generates a connection ticket, and
- *      publishes a 6-digit PIN → ticket mapping to GunDB (ephemeral, public,
- *      no auth required).
- *   2. Receiver looks up the PIN in GunDB, parses the ticket, connects to the
- *      sender's Endpoint, opens a bidirectional QUIC stream, and pipes the
- *      incoming bytes into a downloadable Blob.
+ * The PIN→ticket mapping uses a multi-layer strategy:
+ *   1. localStorage — for same-device/demo transfers (sender and receiver in
+ *      the same browser tab or origin).
+ *   2. GunDB with public relay peers — for cross-device transfers. GunDB is
+ *      a serverless, decentralized key-value graph that syncs across peers
+ *      without a central database.
  *
- * The Iroh browser WASM package (`@number0/iroh-browser`) is imported
- * dynamically so the app builds and runs even before the package is published.
- * If the import fails, the engine falls back to a realistic in-tab simulation
- * so the full UI flow remains demonstrable.
+ * The actual Iroh browser WASM package (`@number0/iroh-browser`) is not yet
+ * published on npm. When it becomes available, the dynamic import resolves and
+ * real P2P transfers activate automatically. Until then, a simulation
+ * fallback exercises the exact same callback flow so the UI is fully
+ * functional.
  */
 
 // --- Types ------------------------------------------------------------------
@@ -25,15 +25,10 @@ export type TransferStage =
   | 'Transfer Complete';
 
 export type TransferProgress = {
-  /** 0–100 percentage */
   percent: number;
-  /** bytes transferred */
   bytesTransferred: number;
-  /** total bytes */
   totalBytes: number;
-  /** MB/s */
   speed: number;
-  /** estimated seconds remaining */
   eta: number;
 };
 
@@ -58,15 +53,87 @@ export type ReceiverSession = {
   downloadUrl: string;
 };
 
+type TransferMeta = { fileName: string; fileSize: number };
+type TicketEntry = TransferMeta & { ticket: string };
+
 // --- Constants --------------------------------------------------------------
 
 const ALPN = Array.from(new TextEncoder().encode('meshdrop/1'));
 const IROH_BROWSER_IMPORT = '@number0/iroh-browser';
 const TICKET_TTL_MS = 10 * 60 * 1000;
+const STORAGE_PREFIX = 'meshdrop-pin-';
+const CHUNK_SIZE = 64 * 1024;
+const RESOLVE_TIMEOUT_MS = 10000;
+const RESOLVE_POLL_MS = 800;
 
-// --- Ephemeral key-value store (GunDB) -------------------------------------
+// --- PIN → Ticket store (localStorage + GunDB) ------------------------------
 
-type GunInstance = {
+let gunInstance: GunDB | null = null;
+
+async function getGun(): Promise<GunDB | null> {
+  if (gunInstance) return gunInstance;
+  try {
+    const Gun = (await import('gun')).default;
+    const peers = [
+      'https://gun-manhattan.herokuapp.com/gun',
+      'https://peer.wallie.io/gun',
+      'https://gunjs.herokuapp.com/gun',
+    ];
+    gunInstance = new (Gun as unknown as new (opts: { peers: string[] }) => GunDB)({ peers });
+    return gunInstance;
+  } catch {
+    return null;
+  }
+}
+
+async function publishTicket(pin: string, ticket: string, meta: TransferMeta): Promise<void> {
+  const entry = { ticket, fileName: meta.fileName, fileSize: String(meta.fileSize), ts: String(Date.now()) };
+  const key = STORAGE_PREFIX + pin;
+  try { localStorage.setItem(key, JSON.stringify(entry)); } catch { /* ignore quota errors */ }
+  const gun = await getGun();
+  if (gun) gun.get('meshdrop').get(pin).put(entry);
+  setTimeout(() => {
+    try { localStorage.removeItem(key); } catch { /* already gone */ }
+    if (gun) gun.get('meshdrop').get(pin).put(null);
+  }, TICKET_TTL_MS);
+}
+
+async function resolveTicket(pin: string): Promise<TicketEntry | null> {
+  const key = STORAGE_PREFIX + pin;
+
+  // Layer 1: localStorage (same device / same browser)
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw) {
+      const data = JSON.parse(raw) as { ticket: string; fileName: string; fileSize: string };
+      if (data.ticket) return { ticket: data.ticket, fileName: data.fileName, fileSize: parseInt(data.fileSize || '0', 10) };
+    }
+  } catch { /* ignore parse errors */ }
+
+  // Layer 2: GunDB (cross-device) — poll for up to RESOLVE_TIMEOUT_MS
+  const gun = await getGun();
+  if (!gun) return null;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: TicketEntry | null) => {
+      if (settled) return;
+      settled = true;
+      gun.get('meshdrop').get(pin).off();
+      resolve(value);
+    };
+
+    gun.get('meshdrop').get(pin).once((data) => {
+      if (data && data.ticket) {
+        finish({ ticket: data.ticket, fileName: data.fileName || 'received-file', fileSize: parseInt(data.fileSize || '0', 10) });
+      }
+    });
+
+    setTimeout(() => finish(null), RESOLVE_TIMEOUT_MS);
+  });
+}
+
+type GunDB = {
   get: (key: string) => GunNode;
 };
 
@@ -74,61 +141,21 @@ type GunNode = {
   get: (key: string) => GunNode;
   put: (data: Record<string, unknown> | null) => GunNode;
   once: (cb: (data: Record<string, string> | null) => void) => GunNode;
+  off: () => GunNode;
   set: (value: unknown) => GunNode;
 };
-
-let gunInstance: GunInstance | null = null;
-
-async function getGun(): Promise<GunInstance> {
-  if (gunInstance) return gunInstance;
-  const Gun = (await import('gun')).default;
-  gunInstance = new (Gun as unknown as new () => GunInstance)();
-  return gunInstance;
-}
-
-async function publishTicket(pin: string, ticket: string, meta: TransferMeta): Promise<void> {
-  const gun = await getGun();
-  const entry = { ticket, fileName: meta.fileName, fileSize: String(meta.fileSize), ts: String(Date.now()) };
-  gun.get('meshdrop').get(pin).put(entry);
-  setTimeout(() => gun.get('meshdrop').get(pin).put(null as unknown as Record<string, never>), TICKET_TTL_MS);
-}
-
-async function resolveTicket(pin: string): Promise<TicketEntry | null> {
-  const gun = await getGun();
-  return new Promise((resolve) => {
-    let settled = false;
-    gun.get('meshdrop').get(pin).once((data) => {
-      if (settled) return;
-      settled = true;
-      if (!data || !data.ticket) return resolve(null);
-      resolve({
-        ticket: data.ticket,
-        fileName: data.fileName || 'received-file',
-        fileSize: parseInt(data.fileSize || '0', 10),
-      });
-    });
-    setTimeout(() => { if (!settled) { settled = true; resolve(null); } }, 8000);
-  });
-}
-
-type TransferMeta = { fileName: string; fileSize: number };
-type TicketEntry = TransferMeta & { ticket: string };
 
 // --- Iroh dynamic loader ----------------------------------------------------
 
 type IrohModule = {
-  Endpoint: {
-    bind: (opts?: { alpns?: number[][] }) => Promise<IrohEndpoint>;
-  };
+  Endpoint: { bind: (opts?: { alpns?: number[][] }) => Promise<IrohEndpoint> };
   EndpointTicket: {
     fromAddr: (addr: unknown) => { toString: () => string };
     fromString: (str: string) => { endpointAddr: () => unknown };
   };
 };
 
-type IrohIncoming = {
-  accept: () => Promise<IrohConnection>;
-};
+type IrohIncoming = { accept: () => Promise<IrohConnection> };
 
 type IrohEndpoint = {
   addr: () => unknown;
@@ -184,8 +211,6 @@ function calcEta(remainingBytes: number, bytesPerSec: number): number {
   return Math.ceil(remainingBytes / bytesPerSec);
 }
 
-const CHUNK_SIZE = 64 * 1024;
-
 async function fileToChunks(file: File): Promise<Uint8Array[]> {
   const chunks: Uint8Array[] = [];
   for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
@@ -199,17 +224,25 @@ function bytesToBlobUrl(chunks: Uint8Array[], type: string): string {
   return URL.createObjectURL(new Blob(chunks, { type: type || 'application/octet-stream' }));
 }
 
-// --- Simulated transfer (fallback) -----------------------------------------
+const defaultCallbacks: TransferCallbacks = {
+  onStage: () => {},
+  onProgress: () => {},
+  onComplete: () => {},
+  onError: () => {},
+};
+
+// --- Simulated transfers (fallback when Iroh WASM is unavailable) -----------
 
 async function simulatedSend(file: File, pin: string, cb: TransferCallbacks): Promise<SenderSession> {
   const ticket = `sim-ticket-${pin}-${Date.now()}`;
   await publishTicket(pin, ticket, { fileName: file.name, fileSize: file.size });
+  cb.onStage('Waiting for Peer...');
   return { endpointTicket: ticket, pairingPin: pin, file };
 }
 
 async function simulatedReceive(pin: string, cb: TransferCallbacks): Promise<ReceiverSession> {
   const entry = await resolveTicket(pin);
-  if (!entry) throw new Error('No active transfer found for that PIN. Check the code and try again.');
+  if (!entry) throw new Error('No active transfer found for that PIN. Ask the sender to share their 6-digit code, then try again.');
 
   cb.onStage('Actively Streaming Data');
   const chunkCount = Math.max(1, Math.ceil(entry.fileSize / (2 * 1024 * 1024)));
@@ -223,13 +256,12 @@ async function simulatedReceive(pin: string, cb: TransferCallbacks): Promise<Rec
     fakeChunks.push(new Uint8Array(chunkBytes));
     transferred += chunkBytes;
     const elapsed = (Date.now() - startTime) / 1000;
-    const speed = formatSpeed(transferred / Math.max(elapsed, 0.1));
     cb.onProgress({
       percent: Math.round((transferred / entry.fileSize) * 100),
       bytesTransferred: transferred,
       totalBytes: entry.fileSize,
-      speed,
-      eta: calcEta(entry.fileSize - transferred, (transferred / Math.max(elapsed, 0.1))),
+      speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+      eta: calcEta(entry.fileSize - transferred, transferred / Math.max(elapsed, 0.1)),
     });
   }
 
@@ -245,13 +277,13 @@ async function irohSend(file: File, pin: string, iroh: IrohModule, cb: TransferC
   const endpoint = await iroh.Endpoint.bind({ alpns: [ALPN] });
   const ticket = iroh.EndpointTicket.fromAddr(endpoint.addr()).toString();
   await publishTicket(pin, ticket, { fileName: file.name, fileSize: file.size });
+  cb.onStage('Waiting for Peer...');
 
   const chunks = await fileToChunks(file);
   let connectionClosed = false;
 
   (async () => {
     try {
-      cb.onStage('Waiting for Peer...');
       const incoming = await endpoint.acceptNext();
       const conn = await incoming.accept();
       const bi = await conn.acceptBi();
@@ -327,29 +359,66 @@ async function irohReceive(pin: string, iroh: IrohModule, cb: TransferCallbacks)
 }
 
 // --- Public API -------------------------------------------------------------
+//
+// initSenderEngine: call ONCE when the user drops/selects a file.
+//   Generates a PIN, publishes the ticket, and transitions to "Waiting for
+//   Peer...". The returned SenderSession should be stored — do NOT call this
+//   function again for the same file.
+//
+// streamSenderFile: call when the user clicks "Start secure transfer".
+//   Begins streaming the file data to the connected receiver.
+
+const activeSenderSessions = new Map<string, SenderSession>();
 
 export async function initSenderEngine(file: File, cb?: TransferCallbacks): Promise<SenderSession> {
+  const cbs = cb ?? defaultCallbacks;
   const pin = generatePin();
-  cb?.onStage('Hashing File');
+  cbs.onStage('Hashing File');
 
   const iroh = await loadIroh();
-  if (iroh) {
-    return irohSend(file, pin, iroh, cb ?? defaultCallbacks);
+  const session = iroh
+    ? await irohSend(file, pin, iroh, cbs)
+    : await simulatedSend(file, pin, cbs);
+
+  activeSenderSessions.set(pin, session);
+  return session;
+}
+
+export async function streamSenderFile(pin: string, cb?: TransferCallbacks): Promise<void> {
+  const cbs = cb ?? defaultCallbacks;
+  const session = activeSenderSessions.get(pin);
+  if (!session) return;
+  cbs.onStage('Actively Streaming Data');
+
+  const iroh = await loadIroh();
+  if (iroh) return; // real Iroh streams automatically after acceptNext()
+
+  // Simulation: stream the file in chunks
+  const file = session.file;
+  const chunks = await fileToChunks(file);
+  let transferred = 0;
+  const startTime = Date.now();
+
+  for (const chunk of chunks) {
+    await new Promise((r) => setTimeout(r, 30));
+    transferred += chunk.byteLength;
+    const elapsed = (Date.now() - startTime) / 1000;
+    cbs.onProgress({
+      percent: Math.round((transferred / file.size) * 100),
+      bytesTransferred: transferred,
+      totalBytes: file.size,
+      speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+      eta: calcEta(file.size - transferred, transferred / Math.max(elapsed, 0.1)),
+    });
   }
-  return simulatedSend(file, pin, cb ?? defaultCallbacks);
+
+  cbs.onStage('Transfer Complete');
+  activeSenderSessions.delete(pin);
 }
 
 export async function initReceiverEngine(pin: string, cb?: TransferCallbacks): Promise<ReceiverSession> {
+  const cbs = cb ?? defaultCallbacks;
   const iroh = await loadIroh();
-  if (iroh) {
-    return irohReceive(pin, iroh, cb ?? defaultCallbacks);
-  }
-  return simulatedReceive(pin, cb ?? defaultCallbacks);
+  if (iroh) return irohReceive(pin, iroh, cbs);
+  return simulatedReceive(pin, cbs);
 }
-
-const defaultCallbacks: TransferCallbacks = {
-  onStage: () => {},
-  onProgress: () => {},
-  onComplete: () => {},
-  onError: () => {},
-};

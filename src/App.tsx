@@ -29,6 +29,8 @@ import {
 import {
   initReceiverEngine,
   initSenderEngine,
+  streamSenderFile,
+  type SenderSession,
   type TransferCallbacks,
   type TransferProgress,
   type TransferStage,
@@ -104,6 +106,7 @@ function App() {
   const [errorMessage, setErrorMessage] = useState('');
   const [downloadUrl, setDownloadUrl] = useState('');
   const [downloadName, setDownloadName] = useState('');
+  const [senderSession, setSenderSession] = useState<SenderSession | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>(() => {
     const saved = localStorage.getItem('meshdrop-history');
     return saved ? JSON.parse(saved) as HistoryEntry[] : initialHistory;
@@ -161,6 +164,7 @@ function App() {
     setStage('Hashing File');
     const session = await initSenderEngine(nextFile, callbacksRef.current);
     setPin(session.pairingPin);
+    setSenderSession(session);
   };
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -184,10 +188,9 @@ function App() {
   };
 
   const startSendTransfer = async () => {
-    if (!file) return;
+    if (!file || !senderSession) return;
     setProgress({ percent: 0, bytesTransferred: 0, totalBytes: file.size, speed: 0, eta: 0 });
-    setStage('Actively Streaming Data');
-    void initSenderEngine(file, callbacksRef.current);
+    await streamSenderFile(senderSession.pairingPin, callbacksRef.current);
   };
 
   const startReceiveTransfer = async () => {
@@ -214,6 +217,7 @@ function App() {
     setSecondsLeft(600);
     setErrorMessage('');
     setDownloadUrl('');
+    setSenderSession(null);
   };
 
   return (
