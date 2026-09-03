@@ -1,16 +1,15 @@
 /**
- * Serverless transfer engine for Meshdrop.
+ * Peer-to-peer transfer engine for Meshdrop.
  *
- * Uses Supabase as the transport layer for cross-device file transfers:
- *   - `transfer_tickets` stores PIN → file metadata
- *   - `transfer_chunks` stores file data in 256KB chunks
- *   - `transfer_chat` stores ephemeral text messages
+ * Uses WebRTC data channels for direct device-to-device file transfer.
+ * Supabase is used only for:
+ *   - `transfer_tickets`: PIN → file metadata (signaling)
+ *   - `transfer_chat`: ephemeral text messages
+ *   - Supabase Realtime: SDP/ICE exchange for WebRTC handshake
  *
+ * File data flows directly between browsers — never stored on any server.
  * For same-device transfers (sender and receiver in the same browser),
- * an in-memory fast path is used — no network round-trips needed.
- *
- * Real-time chat uses Supabase Realtime broadcast on the `transfer_chat`
- * channel so messages appear instantly on both sides.
+ * an in-memory fast path is used.
  */
 
 import { createClient, type RealtimeChannel } from '@supabase/supabase-js';
@@ -21,6 +20,7 @@ export type TransferStage =
   | 'Idle'
   | 'Hashing File'
   | 'Waiting for Peer...'
+  | 'Connecting...'
   | 'Actively Streaming Data'
   | 'Transfer Complete';
 
@@ -69,11 +69,16 @@ type TicketEntry = TransferMeta & { ticket: string };
 
 const TICKET_TTL_MS = 10 * 60 * 1000;
 const STORAGE_PREFIX = 'meshdrop-pin-';
-const CHUNK_SIZE = 256 * 1024; // 256KB per chunk
+const CHUNK_SIZE = 16 * 1024; // 16KB per WebRTC message (reliable size for data channels)
 const RESOLVE_TIMEOUT_MS = 30000;
 const RESOLVE_POLL_MS = 1000;
-const POLL_CHUNK_INTERVAL_MS = 500;
 const MAX_MESSAGE_LENGTH = 1000;
+const RTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ],
+};
 
 // --- Supabase client --------------------------------------------------------
 
@@ -82,7 +87,7 @@ const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
 const supabase = supabaseUrl && supabaseAnonKey && /^https?:\/\//i.test(supabaseUrl)
   ? createClient(supabaseUrl, supabaseAnonKey, {
-      realtime: { params: { eventsPerSecond: 10 } },
+      realtime: { params: { eventsPerSecond: 20 } },
     })
   : null;
 
@@ -101,31 +106,13 @@ function calcEta(remainingBytes: number, bytesPerSec: number): number {
   return Math.ceil(remainingBytes / bytesPerSec);
 }
 
-async function fileToChunks(file: File): Promise<Uint8Array[]> {
-  const chunks: Uint8Array[] = [];
+async function fileToChunks(file: File): Promise<ArrayBuffer[]> {
+  const chunks: ArrayBuffer[] = [];
   for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
     const buf = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
-    chunks.push(new Uint8Array(buf));
+    chunks.push(buf);
   }
   return chunks;
-}
-
-function bytesToBlobUrl(chunks: Uint8Array[], type: string): string {
-  return URL.createObjectURL(new Blob(chunks, { type: type || 'application/octet-stream' }));
-}
-
-function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary);
-}
-
-function base64ToUint8Array(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
 }
 
 const defaultCallbacks: TransferCallbacks = {
@@ -137,7 +124,7 @@ const defaultCallbacks: TransferCallbacks = {
 
 // --- In-memory store (same-device fast path) --------------------------------
 
-const inMemoryFiles = new Map<string, { chunks: Uint8Array[]; meta: TransferMeta }>();
+const inMemoryFiles = new Map<string, { chunks: ArrayBuffer[]; meta: TransferMeta }>();
 const activeSenderSessions = new Map<string, SenderSession>();
 
 // --- PIN → Ticket store (Supabase + localStorage) ---------------------------
@@ -148,7 +135,7 @@ async function publishTicket(pin: string, meta: TransferMeta): Promise<void> {
   try { localStorage.setItem(key, JSON.stringify(entry)); } catch { /* quota */ }
 
   try {
-    if (!supabase) return; // localStorage is enough for same-device
+    if (!supabase) return;
     const { error } = await supabase.from('transfer_tickets').upsert({
       pin,
       ticket: `supa:${pin}`,
@@ -158,7 +145,6 @@ async function publishTicket(pin: string, meta: TransferMeta): Promise<void> {
     });
     if (error) throw error;
   } catch (error) {
-    // Don't throw — same-device transfer can still work via localStorage
     console.warn('Could not publish to Supabase (cross-device may fail):', (error as Error).message);
   }
 
@@ -166,7 +152,6 @@ async function publishTicket(pin: string, meta: TransferMeta): Promise<void> {
     try { localStorage.removeItem(key); } catch { /* gone */ }
     if (supabase) {
       void supabase.from('transfer_tickets').delete().eq('pin', pin);
-      void supabase.from('transfer_chunks').delete().eq('pin', pin);
       void supabase.from('transfer_chat').delete().eq('pin', pin);
     }
   }, TICKET_TTL_MS);
@@ -175,7 +160,6 @@ async function publishTicket(pin: string, meta: TransferMeta): Promise<void> {
 async function resolveTicket(pin: string): Promise<TicketEntry | null> {
   const key = STORAGE_PREFIX + pin;
 
-  // Layer 1: localStorage (same device)
   try {
     const raw = localStorage.getItem(key);
     if (raw) {
@@ -186,7 +170,6 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
     }
   } catch { /* parse error */ }
 
-  // Layer 2: Supabase (cross-device) — poll until row appears or timeout
   if (!supabase) return null;
   const deadline = Date.now() + RESOLVE_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -201,7 +184,7 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
       if (data) {
         return { ticket: data.ticket, fileName: data.file_name, fileSize: data.file_size, fileType: data.file_type || 'application/octet-stream' };
       }
-    } catch { /* network blip — keep polling */ }
+    } catch { /* network blip */ }
     await new Promise((r) => setTimeout(r, RESOLVE_POLL_MS));
   }
 
@@ -212,111 +195,306 @@ async function deleteTicket(pin: string): Promise<void> {
   try { localStorage.removeItem(STORAGE_PREFIX + pin); } catch { /* gone */ }
   try {
     if (supabase) {
-      await Promise.all([
-        supabase.from('transfer_tickets').delete().eq('pin', pin),
-        supabase.from('transfer_chunks').delete().eq('pin', pin),
-        supabase.from('transfer_chat').delete().eq('pin', pin),
-      ]);
+      await supabase.from('transfer_tickets').delete().eq('pin', pin);
+      await supabase.from('transfer_chat').delete().eq('pin', pin);
     }
   } catch { /* gone */ }
 }
 
-// --- Chunk upload/download --------------------------------------------------
+// --- WebRTC Signaling via Supabase Realtime ---------------------------------
 
-async function uploadChunks(pin: string, chunks: Uint8Array[], cb: TransferCallbacks, totalSize: number): Promise<void> {
-  if (!supabase) throw new Error('Supabase is not configured for cross-device transfers.');
+type SignalPayload =
+  | { type: 'offer'; sdp: string }
+  | { type: 'answer'; sdp: string }
+  | { type: 'ice'; candidate: string; sdpMid: string | null; sdpMLineIndex: number | null };
 
-  let transferred = 0;
-  const startTime = Date.now();
+let signalChannel: RealtimeChannel | null = null;
 
-  for (let i = 0; i < chunks.length; i++) {
-    const b64 = uint8ArrayToBase64(chunks[i]);
-    const { error } = await supabase.from('transfer_chunks').insert({
-      pin,
-      chunk_index: i,
-      data: b64,
-    });
-    if (error) throw new Error(`Failed to upload chunk ${i}: ${error.message}`);
+function joinSignalChannel(pin: string, onSignal: (payload: SignalPayload) => void): void {
+  if (!supabase) return;
 
-    transferred += chunks[i].byteLength;
-    const elapsed = (Date.now() - startTime) / 1000;
-    cb.onProgress({
-      percent: Math.round((transferred / totalSize) * 100),
-      bytesTransferred: transferred,
-      totalBytes: totalSize,
-      speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-      eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
-    });
+  if (signalChannel) {
+    void supabase.removeChannel(signalChannel);
+    signalChannel = null;
+  }
+
+  signalChannel = supabase
+    .channel(`signal:${pin}`)
+    .on('broadcast', { event: 'signal' }, (payload: { payload: SignalPayload }) => {
+      onSignal(payload.payload);
+    })
+    .subscribe();
+}
+
+function sendSignal(pin: string, payload: SignalPayload): void {
+  if (!signalChannel) return;
+  void signalChannel.send({ type: 'broadcast', event: 'signal', payload });
+}
+
+function leaveSignalChannel(): void {
+  if (signalChannel && supabase) {
+    void supabase.removeChannel(signalChannel);
+    signalChannel = null;
   }
 }
 
-async function downloadChunks(pin: string, totalSize: number, fileType: string, cb: TransferCallbacks): Promise<string> {
-  // Try in-memory first (same device)
-  const stored = inMemoryFiles.get(pin);
-  if (stored) {
+// --- WebRTC Sender -----------------------------------------------------------
+
+async function sendViaWebRTC(
+  pin: string,
+  file: File,
+  chunks: ArrayBuffer[],
+  cb: TransferCallbacks,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    const dc = pc.createDataChannel('file-transfer', { ordered: true });
     let transferred = 0;
     const startTime = Date.now();
-    for (const chunk of stored.chunks) {
-      await new Promise((r) => setTimeout(r, 10));
-      transferred += chunk.byteLength;
-      const elapsed = (Date.now() - startTime) / 1000;
-      cb.onProgress({
-        percent: Math.round((transferred / totalSize) * 100),
-        bytesTransferred: transferred,
-        totalBytes: totalSize,
-        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-        eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
-      });
-    }
-    const url = URL.createObjectURL(new Blob(stored.chunks, { type: fileType }));
-    inMemoryFiles.delete(pin);
-    return url;
-  }
+    let chunkIndex = 0;
+    let resolved = false;
 
-  if (!supabase) throw new Error('Supabase is not configured for cross-device transfers.');
+    const cleanup = () => {
+      dc.close();
+      pc.close();
+      leaveSignalChannel();
+    };
 
-  // Poll for chunks from Supabase
-  const receivedChunks: Uint8Array[] = [];
-  let transferred = 0;
-  const startTime = Date.now();
-  let nextIndex = 0;
-  const totalChunks = Math.max(1, Math.ceil(totalSize / CHUNK_SIZE));
+    const fail = (msg: string) => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      cb.onError(msg);
+      reject(new Error(msg));
+    };
 
-  while (nextIndex < totalChunks) {
-    const { data, error } = await supabase
-      .from('transfer_chunks')
-      .select('chunk_index, data')
-      .eq('pin', pin)
-      .gte('chunk_index', nextIndex)
-      .order('chunk_index')
-      .limit(50);
+    cb.onStage('Connecting...');
 
-    if (error) throw new Error(`Failed to download chunks: ${error.message}`);
-    if (!data || data.length === 0) {
-      await new Promise((r) => setTimeout(r, POLL_CHUNK_INTERVAL_MS));
-      continue;
-    }
+    // Receive ICE candidates from receiver
+    joinSignalChannel(pin, async (signal) => {
+      try {
+        if (signal.type === 'answer') {
+          await pc.setRemoteDescription({ type: 'answer', sdp: signal.sdp });
+        } else if (signal.type === 'ice') {
+          await pc.addIceCandidate({
+            candidate: signal.candidate,
+            sdpMid: signal.sdpMid,
+            sdpMLineIndex: signal.sdpMLineIndex,
+          });
+        }
+      } catch (err) {
+        fail(`Signaling error: ${(err as Error).message}`);
+      }
+    });
 
-    for (const row of data) {
-      if (row.chunk_index === nextIndex) {
-        const bytes = base64ToUint8Array(row.data);
-        receivedChunks.push(bytes);
-        transferred += bytes.byteLength;
-        nextIndex++;
-
-        const elapsed = (Date.now() - startTime) / 1000;
-        cb.onProgress({
-          percent: Math.round((transferred / totalSize) * 100),
-          bytesTransferred: transferred,
-          totalBytes: totalSize,
-          speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-          eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
+    // Send our ICE candidates to receiver
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendSignal(pin, {
+          type: 'ice',
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
         });
       }
-    }
-  }
+    };
 
-  return URL.createObjectURL(new Blob(receivedChunks, { type: fileType }));
+    dc.onopen = () => {
+      cb.onStage('Actively Streaming Data');
+      sendNext();
+    };
+
+    dc.onclose = () => {
+      if (!resolved) {
+        if (chunkIndex >= chunks.length) {
+          resolved = true;
+          cb.onStage('Transfer Complete');
+          cleanup();
+          resolve();
+        } else {
+          fail('Connection closed before transfer completed');
+        }
+      }
+    };
+
+    dc.onerror = () => fail('Data channel error');
+
+    function sendNext() {
+      if (dc.bufferedAmount > 4 * 1024 * 1024) {
+        setTimeout(sendNext, 20);
+        return;
+      }
+      if (chunkIndex >= chunks.length) {
+        // Send a done marker
+        dc.send(JSON.stringify({ done: true }));
+        // Wait for receiver to close, then resolve
+        setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            cb.onStage('Transfer Complete');
+            cleanup();
+            resolve();
+          }
+        }, 500);
+        return;
+      }
+      const chunk = chunks[chunkIndex];
+      dc.send(chunk);
+      transferred += chunk.byteLength;
+      chunkIndex++;
+
+      const elapsed = (Date.now() - startTime) / 1000;
+      cb.onProgress({
+        percent: Math.round((transferred / file.size) * 100),
+        bytesTransferred: transferred,
+        totalBytes: file.size,
+        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+        eta: calcEta(file.size - transferred, transferred / Math.max(elapsed, 0.1)),
+      });
+
+      sendNext();
+    }
+
+    // Create offer and send to receiver
+    pc.createOffer()
+      .then((offer) => pc.setLocalDescription(offer))
+      .then(() => {
+        sendSignal(pin, { type: 'offer', sdp: pc.localDescription!.sdp ?? '' });
+      })
+      .catch((err) => fail(`Failed to create offer: ${(err as Error).message}`));
+
+    // Safety timeout
+    setTimeout(() => {
+      if (!resolved && dc.readyState !== 'open') {
+        fail('Connection timed out — the receiver may not be online');
+      }
+    }, 30000);
+  });
+}
+
+// --- WebRTC Receiver --------------------------------------------------------
+
+async function receiveViaWebRTC(
+  pin: string,
+  totalSize: number,
+  fileType: string,
+  cb: TransferCallbacks,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    let dc: RTCDataChannel | null = null;
+    const receivedChunks: ArrayBuffer[] = [];
+    let transferred = 0;
+    const startTime = Date.now();
+    let resolved = false;
+
+    const cleanup = () => {
+      if (dc) dc.close();
+      pc.close();
+      leaveSignalChannel();
+    };
+
+    const fail = (msg: string) => {
+      if (resolved) return;
+      resolved = true;
+      cleanup();
+      cb.onError(msg);
+      reject(new Error(msg));
+    };
+
+    cb.onStage('Connecting...');
+
+    // Receive offer and ICE from sender
+    joinSignalChannel(pin, async (signal) => {
+      try {
+        if (signal.type === 'offer') {
+          await pc.setRemoteDescription({ type: 'offer', sdp: signal.sdp });
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sendSignal(pin, { type: 'answer', sdp: answer.sdp ?? '' });
+        } else if (signal.type === 'ice') {
+          await pc.addIceCandidate({
+            candidate: signal.candidate,
+            sdpMid: signal.sdpMid,
+            sdpMLineIndex: signal.sdpMLineIndex,
+          });
+        }
+      } catch (err) {
+        fail(`Signaling error: ${(err as Error).message}`);
+      }
+    });
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendSignal(pin, {
+          type: 'ice',
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+        });
+      }
+    };
+
+    pc.ondatachannel = (event) => {
+      dc = event.channel;
+      cb.onStage('Actively Streaming Data');
+
+      dc.onmessage = (event) => {
+        // Check for done marker
+        if (typeof event.data === 'string') {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.done) {
+              resolved = true;
+              cb.onStage('Transfer Complete');
+              const url = URL.createObjectURL(new Blob(receivedChunks, { type: fileType }));
+              cleanup();
+              resolve(url);
+              return;
+            }
+          } catch { /* not JSON, treat as binary */ }
+        }
+
+        // Binary chunk
+        if (event.data instanceof ArrayBuffer) {
+          receivedChunks.push(event.data);
+          transferred += event.data.byteLength;
+
+          const elapsed = (Date.now() - startTime) / 1000;
+          cb.onProgress({
+            percent: Math.round((transferred / totalSize) * 100),
+            bytesTransferred: transferred,
+            totalBytes: totalSize,
+            speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+            eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
+          });
+        }
+      };
+
+      dc.onclose = () => {
+        if (!resolved) {
+          if (transferred >= totalSize) {
+            resolved = true;
+            cb.onStage('Transfer Complete');
+            const url = URL.createObjectURL(new Blob(receivedChunks, { type: fileType }));
+            cleanup();
+            resolve(url);
+          } else {
+            fail('Connection closed before transfer completed');
+          }
+        }
+      };
+
+      dc.onerror = () => fail('Data channel error');
+    };
+
+    // Safety timeout
+    setTimeout(() => {
+      if (!resolved && (!dc || dc.readyState !== 'open')) {
+        fail('Connection timed out — the sender may not be online');
+      }
+    }, 30000);
+  });
 }
 
 // --- Chat -------------------------------------------------------------------
@@ -353,11 +531,6 @@ export function joinChat(pin: string, role: 'sender' | 'receiver', callbacks: Ch
 export async function sendChatMessage(pin: string, sender: 'sender' | 'receiver', message: string): Promise<void> {
   const trimmed = message.trim().slice(0, MAX_MESSAGE_LENGTH);
   if (!trimmed) return;
-
-  // In-memory fast path for same-device
-  const stored = inMemoryFiles.has(pin) || localStorage.getItem(STORAGE_PREFIX + pin);
-  if (stored && !supabase) return;
-
   if (!supabase) return;
 
   const { error } = await supabase.from('transfer_chat').insert({
@@ -390,6 +563,7 @@ export function leaveChat(): void {
     void supabase.removeChannel(chatChannel);
     chatChannel = null;
   }
+  leaveSignalChannel();
 }
 
 // --- Public API: Sender ------------------------------------------------------
@@ -402,10 +576,7 @@ export async function initSenderEngine(file: File, cb?: TransferCallbacks): Prom
   const meta: TransferMeta = { fileName: file.name, fileSize: file.size, fileType: file.type || 'application/octet-stream' };
   const chunks = await fileToChunks(file);
 
-  // Store in memory for same-device fast path
   inMemoryFiles.set(pin, { chunks, meta });
-
-  // Publish ticket (Supabase + localStorage)
   await publishTicket(pin, meta);
   cbs.onStage('Waiting for Peer...');
 
@@ -422,22 +593,14 @@ export async function streamSenderFile(pin: string, cb?: TransferCallbacks): Pro
   const stored = inMemoryFiles.get(pin);
   if (!stored) return;
 
-  cbs.onStage('Actively Streaming Data');
-
-  // If Supabase is available, upload chunks for cross-device transfer
-  if (supabase) {
-    try {
-      await uploadChunks(pin, stored.chunks, cbs, stored.meta.fileSize);
-    } catch (error) {
-      cbs.onError((error as Error).message);
-      return;
-    }
-  } else {
-    // Same-device only: simulate progress
+  // Same-device fast path: in-memory, no WebRTC needed
+  const isSameDevice = localStorage.getItem(STORAGE_PREFIX + pin) !== null && !supabase;
+  if (isSameDevice) {
+    cbs.onStage('Actively Streaming Data');
     let transferred = 0;
     const startTime = Date.now();
     for (const chunk of stored.chunks) {
-      await new Promise((r) => setTimeout(r, 20));
+      await new Promise((r) => setTimeout(r, 5));
       transferred += chunk.byteLength;
       const elapsed = (Date.now() - startTime) / 1000;
       cbs.onProgress({
@@ -448,10 +611,18 @@ export async function streamSenderFile(pin: string, cb?: TransferCallbacks): Pro
         eta: calcEta(stored.meta.fileSize - transferred, transferred / Math.max(elapsed, 0.1)),
       });
     }
+    cbs.onStage('Transfer Complete');
+    activeSenderSessions.delete(pin);
+    return;
   }
 
-  cbs.onStage('Transfer Complete');
-  activeSenderSessions.delete(pin);
+  // Cross-device: WebRTC P2P
+  try {
+    await sendViaWebRTC(pin, session.file, stored.chunks, cbs);
+    activeSenderSessions.delete(pin);
+  } catch (error) {
+    cbs.onError((error as Error).message);
+  }
 }
 
 // --- Public API: Receiver ---------------------------------------------------
@@ -462,10 +633,34 @@ export async function initReceiverEngine(pin: string, cb?: TransferCallbacks): P
   const entry = await resolveTicket(pin);
   if (!entry) throw new Error('No active transfer found for that PIN. Ask the sender to share their 6-digit code, then try again.');
 
-  cbs.onStage('Actively Streaming Data');
+  // Same-device fast path
+  const stored = inMemoryFiles.get(pin);
+  if (stored) {
+    cbs.onStage('Actively Streaming Data');
+    let transferred = 0;
+    const startTime = Date.now();
+    for (const chunk of stored.chunks) {
+      await new Promise((r) => setTimeout(r, 5));
+      transferred += chunk.byteLength;
+      const elapsed = (Date.now() - startTime) / 1000;
+      cbs.onProgress({
+        percent: Math.round((transferred / stored.meta.fileSize) * 100),
+        bytesTransferred: transferred,
+        totalBytes: stored.meta.fileSize,
+        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+        eta: calcEta(stored.meta.fileSize - transferred, transferred / Math.max(elapsed, 0.1)),
+      });
+    }
+    const url = URL.createObjectURL(new Blob(stored.chunks, { type: stored.meta.fileType }));
+    inMemoryFiles.delete(pin);
+    cbs.onStage('Transfer Complete');
+    cbs.onComplete(url, entry.fileName, entry.fileSize);
+    await deleteTicket(pin);
+    return { pairingPin: pin, fileName: entry.fileName, fileSize: entry.fileSize, downloadUrl: url };
+  }
 
-  const downloadUrl = await downloadChunks(pin, entry.fileSize, entry.fileType, cbs);
-
+  // Cross-device: WebRTC P2P
+  const downloadUrl = await receiveViaWebRTC(pin, entry.fileSize, entry.fileType, cbs);
   cbs.onStage('Transfer Complete');
   cbs.onComplete(downloadUrl, entry.fileName, entry.fileSize);
   await deleteTicket(pin);
