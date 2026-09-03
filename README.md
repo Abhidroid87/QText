@@ -89,6 +89,15 @@ npm run lint       # ESLint
 1. Run `npm run build` — outputs to `dist/`
 2. Deploy the `dist/` folder to your static host
 
+For the GitHub Pages workflow, add these repository secrets under **Settings →
+Secrets and variables → Actions**:
+
+- `VITE_SUPABASE_URL` — your Supabase project URL
+- `VITE_SUPABASE_ANON_KEY` — your Supabase anon/public key
+
+The workflow passes these values into the Vite build and stops if either is
+missing. Never use the Supabase service-role key in a frontend deployment.
+
 **Critical:** Your hosting provider must serve the COOP/COEP headers for the Iroh WASM layer to function:
 
 ```
