@@ -20,10 +20,10 @@ Sender (Browser A)                    Receiver (Browser B)
      ├─ Selects a file                       │
      ├─ Engine generates a 6-digit PIN       │
      ├─ PIN → ticket mapping published       │
-     │  to GunDB + localStorage              │
+     │  to Supabase + localStorage           │
      ├─ Shares PIN with receiver ──────────→ ├─ Enters 6-digit PIN
      │                                      ├─ Engine looks up PIN in
-     │                                      │  GunDB / localStorage
+     │                                      │  Supabase / localStorage
      │                                      ├─ Resolves connection ticket
      │                                      ├─ Establishes P2P stream
      │ ←────────── file chunks flow ────────┤
@@ -34,7 +34,7 @@ Sender (Browser A)                    Receiver (Browser B)
 ### PIN-to-Ticket Mapping (Two Layers)
 
 1. **localStorage** — for same-device transfers (sender and receiver in the same browser). Instant lookup, no network needed.
-2. **GunDB with public relay peers** — for cross-device transfers. GunDB is a serverless, decentralized key-value graph that syncs across browsers without a central database. Three public relay peers are configured for redundancy.
+2. **Supabase database** — for cross-device transfers. The `transfer_tickets` table stores the ephemeral PIN → ticket mapping. Rows auto-expire after 10 minutes. The table is publicly readable/writable (no sign-in required) via Supabase Row Level Security policies scoped to the `anon` role.
 
 ### P2P Transport (Iroh)
 
@@ -51,7 +51,7 @@ The transfer engine uses the official Iroh browser WebAssembly runtime for direc
 | Styling | Tailwind CSS + custom CSS |
 | Icons | Lucide React |
 | P2P transport | Iroh (WebAssembly, dynamic import) |
-| Ephemeral KV store | GunDB (decentralized, no central DB) |
+| Ephemeral KV store | Supabase (`transfer_tickets` table, auto-expiring) |
 | Local storage | Browser LocalStorage (transfer history + PIN cache) |
 
 ## Getting Started
@@ -140,7 +140,7 @@ Add these as custom headers in the Pages dashboard or via a `_headers` file:
 src/
 ├── App.tsx              # Main UI: send/receive tabs, metrics, history
 ├── lib/
-│   └── transfer.ts      # P2P engine: Iroh + GunDB + simulation fallback
+│   └── transfer.ts      # P2P engine: Iroh + Supabase + simulation fallback
 ├── index.css            # Global styles + Tailwind
 └── main.tsx             # React entry point
 vite.config.ts           # Vite config with COOP/COEP headers
@@ -163,8 +163,8 @@ The UI cycles through these connection states:
 **"No active transfer found for that PIN"**
 - Make sure the sender has selected a file and their pairing code is displayed
 - The code expires after 10 minutes — ask the sender to re-select the file
-- For cross-device transfers, both devices need internet connectivity for GunDB sync
-- If the GunDB relay peers are down, try again — the app checks three peers for redundancy
+- For cross-device transfers, both devices need internet connectivity to reach the Supabase database
+- The receiver polls for up to 15 seconds — if the sender's network is slow, the PIN may not have synced yet
 
 **File download doesn't start**
 - Check that the transfer state shows "Transfer Complete"
