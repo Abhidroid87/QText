@@ -1,21 +1,19 @@
 /**
- * Serverless P2P transfer engine for Meshdrop.
+ * Serverless transfer engine for Meshdrop.
  *
- * PIN → ticket mapping uses two layers:
- *   1. Supabase `transfer_tickets` table — reliable, always-available,
- *      cross-device lookup. Rows auto-expire after 10 minutes.
- *   2. localStorage — instant same-device fast path (sender and receiver
- *      in the same browser tab or origin).
+ * Uses Supabase as the transport layer for cross-device file transfers:
+ *   - `transfer_tickets` stores PIN → file metadata
+ *   - `transfer_chunks` stores file data in 256KB chunks
+ *   - `transfer_chat` stores ephemeral text messages
  *
- * The Iroh browser WASM package (`@number0/iroh-browser`) is dynamically
- * imported when available. Until it's published, a simulation fallback
- * exercises the same callback flow so the UI is fully functional. In
- * simulation mode, the file data is stored in-memory and streamed directly
- * to the receiver via Supabase polling (the receiver downloads the actual
- * file bytes, not a fake placeholder).
+ * For same-device transfers (sender and receiver in the same browser),
+ * an in-memory fast path is used — no network round-trips needed.
+ *
+ * Real-time chat uses Supabase Realtime broadcast on the `transfer_chat`
+ * channel so messages appear instantly on both sides.
  */
 
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type RealtimeChannel } from '@supabase/supabase-js';
 
 // --- Types ------------------------------------------------------------------
 
@@ -41,14 +39,23 @@ export type TransferCallbacks = {
   onError: (message: string) => void;
 };
 
+export type ChatMessage = {
+  id: string;
+  sender: 'sender' | 'receiver';
+  message: string;
+  timestamp: number;
+};
+
+export type ChatCallbacks = {
+  onMessage: (msg: ChatMessage) => void;
+};
+
 export type SenderSession = {
-  endpointTicket: string;
   pairingPin: string;
   file: File;
 };
 
 export type ReceiverSession = {
-  endpointTicket: string;
   pairingPin: string;
   fileName: string;
   fileSize: number;
@@ -60,13 +67,13 @@ type TicketEntry = TransferMeta & { ticket: string };
 
 // --- Constants --------------------------------------------------------------
 
-const ALPN = Array.from(new TextEncoder().encode('meshdrop/1'));
-const IROH_BROWSER_IMPORT = '@number0/iroh-browser';
 const TICKET_TTL_MS = 10 * 60 * 1000;
 const STORAGE_PREFIX = 'meshdrop-pin-';
-const CHUNK_SIZE = 64 * 1024;
-const RESOLVE_TIMEOUT_MS = 15000;
+const CHUNK_SIZE = 256 * 1024; // 256KB per chunk
+const RESOLVE_TIMEOUT_MS = 30000;
 const RESOLVE_POLL_MS = 1000;
+const POLL_CHUNK_INTERVAL_MS = 500;
+const MAX_MESSAGE_LENGTH = 1000;
 
 // --- Supabase client --------------------------------------------------------
 
@@ -74,59 +81,10 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
 
 const supabase = supabaseUrl && supabaseAnonKey && /^https?:\/\//i.test(supabaseUrl)
-  ? createClient(supabaseUrl, supabaseAnonKey)
+  ? createClient(supabaseUrl, supabaseAnonKey, {
+      realtime: { params: { eventsPerSecond: 10 } },
+    })
   : null;
-
-// --- Iroh dynamic loader ----------------------------------------------------
-
-type IrohModule = {
-  Endpoint: { bind: (opts?: { alpns?: number[][] }) => Promise<IrohEndpoint> };
-  EndpointTicket: {
-    fromAddr: (addr: unknown) => { toString: () => string };
-    fromString: (str: string) => { endpointAddr: () => unknown };
-  };
-};
-
-type IrohIncoming = { accept: () => Promise<IrohConnection> };
-
-type IrohEndpoint = {
-  addr: () => unknown;
-  connect: (addr: unknown, alpn: number[]) => Promise<IrohConnection>;
-  acceptNext: () => Promise<IrohIncoming>;
-  close: () => Promise<void>;
-};
-
-type IrohConnection = {
-  openBi: () => Promise<{ send: IrohSendStream; recv: IrohRecvStream }>;
-  acceptBi: () => Promise<{ send: IrohSendStream; recv: IrohRecvStream }>;
-  close: () => Promise<void>;
-};
-
-type IrohSendStream = {
-  writeAll: (data: number[] | Uint8Array) => Promise<void>;
-  finish: () => Promise<void>;
-};
-
-type IrohRecvStream = {
-  read: (maxLen: number) => Promise<number[] | Uint8Array | null>;
-  readToEnd: (maxLen: number) => Promise<number[] | Uint8Array>;
-  stopped: () => Promise<void>;
-};
-
-let irohModule: IrohModule | null = null;
-let irohLoadFailed = false;
-
-async function loadIroh(): Promise<IrohModule | null> {
-  if (irohModule) return irohModule;
-  if (irohLoadFailed) return null;
-  try {
-    irohModule = await import(/* @vite-ignore */ IROH_BROWSER_IMPORT);
-    return irohModule;
-  } catch {
-    irohLoadFailed = true;
-    return null;
-  }
-}
 
 // --- Utilities --------------------------------------------------------------
 
@@ -156,6 +114,20 @@ function bytesToBlobUrl(chunks: Uint8Array[], type: string): string {
   return URL.createObjectURL(new Blob(chunks, { type: type || 'application/octet-stream' }));
 }
 
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function base64ToUint8Array(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 const defaultCallbacks: TransferCallbacks = {
   onStage: () => {},
   onProgress: () => {},
@@ -163,30 +135,40 @@ const defaultCallbacks: TransferCallbacks = {
   onError: () => {},
 };
 
+// --- In-memory store (same-device fast path) --------------------------------
+
+const inMemoryFiles = new Map<string, { chunks: Uint8Array[]; meta: TransferMeta }>();
+const activeSenderSessions = new Map<string, SenderSession>();
+
 // --- PIN → Ticket store (Supabase + localStorage) ---------------------------
 
-async function publishTicket(pin: string, ticket: string, meta: TransferMeta): Promise<void> {
-  const entry = { ticket, fileName: meta.fileName, fileSize: meta.fileSize, fileType: meta.fileType, ts: String(Date.now()) };
+async function publishTicket(pin: string, meta: TransferMeta): Promise<void> {
+  const entry = { ticket: `mem:${pin}`, fileName: meta.fileName, fileSize: String(meta.fileSize), fileType: meta.fileType, ts: String(Date.now()) };
   const key = STORAGE_PREFIX + pin;
   try { localStorage.setItem(key, JSON.stringify(entry)); } catch { /* quota */ }
 
   try {
-    if (!supabase) throw new Error('Supabase is not configured for cross-device transfers.');
+    if (!supabase) return; // localStorage is enough for same-device
     const { error } = await supabase.from('transfer_tickets').upsert({
       pin,
-      ticket,
+      ticket: `supa:${pin}`,
       file_name: meta.fileName,
       file_size: meta.fileSize,
       file_type: meta.fileType,
     });
     if (error) throw error;
   } catch (error) {
-    throw new Error(`Could not publish transfer code: ${(error as Error).message}`);
+    // Don't throw — same-device transfer can still work via localStorage
+    console.warn('Could not publish to Supabase (cross-device may fail):', (error as Error).message);
   }
 
   setTimeout(() => {
     try { localStorage.removeItem(key); } catch { /* gone */ }
-    if (supabase) void supabase.from('transfer_tickets').delete().eq('pin', pin);
+    if (supabase) {
+      void supabase.from('transfer_tickets').delete().eq('pin', pin);
+      void supabase.from('transfer_chunks').delete().eq('pin', pin);
+      void supabase.from('transfer_chat').delete().eq('pin', pin);
+    }
   }, TICKET_TTL_MS);
 }
 
@@ -205,8 +187,8 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
   } catch { /* parse error */ }
 
   // Layer 2: Supabase (cross-device) — poll until row appears or timeout
-  const deadline = Date.now() + RESOLVE_TIMEOUT_MS;
   if (!supabase) return null;
+  const deadline = Date.now() + RESOLVE_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
       const { data, error } = await supabase
@@ -228,214 +210,206 @@ async function resolveTicket(pin: string): Promise<TicketEntry | null> {
 
 async function deleteTicket(pin: string): Promise<void> {
   try { localStorage.removeItem(STORAGE_PREFIX + pin); } catch { /* gone */ }
-  try { if (supabase) await supabase.from('transfer_tickets').delete().eq('pin', pin); } catch { /* gone */ }
-}
-
-// --- Simulation: in-memory file store ---------------------------------------
-//
-// When Iroh WASM is unavailable, the sender stores the actual file bytes in
-// memory keyed by PIN. The receiver polls Supabase for the ticket, then
-// retrieves the file from this in-memory store. For cross-device simulation
-// transfers, the file is encoded as base64 in the ticket itself (limited to
-// small files for demo purposes).
-
-const inMemoryFiles = new Map<string, { chunks: Uint8Array[]; meta: TransferMeta }>();
-
-const MAX_INLINE_SIZE = 4 * 1024 * 1024; // 4 MB — inline base64 for cross-device demo
-
-async function simulatedSend(file: File, pin: string, cb: TransferCallbacks): Promise<SenderSession> {
-  const meta: TransferMeta = { fileName: file.name, fileSize: file.size, fileType: file.type || 'application/octet-stream' };
-  const chunks = await fileToChunks(file);
-
-  // Store in memory for same-device retrieval
-  inMemoryFiles.set(pin, { chunks, meta });
-
-  // For cross-device: if file is small enough, encode as base64 in the ticket
-  let ticket: string;
-  if (file.size <= MAX_INLINE_SIZE) {
-    const blob = new Blob(chunks, { type: meta.fileType });
-    const arrayBuffer = await blob.arrayBuffer();
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-    ticket = `sim-inline:${base64}`;
-  } else {
-    ticket = `sim-memory:${pin}`;
-  }
-
-  await publishTicket(pin, ticket, meta);
-  cb.onStage('Waiting for Peer...');
-  return { endpointTicket: ticket, pairingPin: pin, file };
-}
-
-async function simulatedReceive(pin: string, cb: TransferCallbacks): Promise<ReceiverSession> {
-  const entry = await resolveTicket(pin);
-  if (!entry) throw new Error('No active transfer found for that PIN. Ask the sender to share their 6-digit code, then try again.');
-
-  cb.onStage('Actively Streaming Data');
-
-  let chunks: Uint8Array[];
-  let downloadUrl: string;
-
-  if (entry.ticket.startsWith('sim-inline:')) {
-    // Cross-device: decode base64 from ticket
-    const base64 = entry.ticket.slice('sim-inline:'.length);
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    chunks = [bytes];
-
-    // Simulate streaming progress
-    const totalChunks = Math.max(1, Math.ceil(bytes.byteLength / (512 * 1024)));
-    let transferred = 0;
-    const startTime = Date.now();
-    for (let i = 0; i < totalChunks; i++) {
-      await new Promise((r) => setTimeout(r, 150));
-      transferred = Math.min(bytes.byteLength, (i + 1) * (512 * 1024));
-      const elapsed = (Date.now() - startTime) / 1000;
-      cb.onProgress({
-        percent: Math.round((transferred / entry.fileSize) * 100),
-        bytesTransferred: transferred,
-        totalBytes: entry.fileSize,
-        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-        eta: calcEta(entry.fileSize - transferred, transferred / Math.max(elapsed, 0.1)),
-      });
+  try {
+    if (supabase) {
+      await Promise.all([
+        supabase.from('transfer_tickets').delete().eq('pin', pin),
+        supabase.from('transfer_chunks').delete().eq('pin', pin),
+        supabase.from('transfer_chat').delete().eq('pin', pin),
+      ]);
     }
-    downloadUrl = URL.createObjectURL(new Blob(chunks, { type: entry.fileType }));
-  } else {
-    // Same-device: retrieve from in-memory store
-    const stored = inMemoryFiles.get(pin);
-    if (stored) {
-      chunks = stored.chunks;
-      let transferred = 0;
-      const startTime = Date.now();
-      for (const chunk of chunks) {
-        await new Promise((r) => setTimeout(r, 20));
-        transferred += chunk.byteLength;
-        const elapsed = (Date.now() - startTime) / 1000;
-        cb.onProgress({
-          percent: Math.round((transferred / entry.fileSize) * 100),
-          bytesTransferred: transferred,
-          totalBytes: entry.fileSize,
-          speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-          eta: calcEta(entry.fileSize - transferred, transferred / Math.max(elapsed, 0.1)),
-        });
-      }
-      downloadUrl = URL.createObjectURL(new Blob(chunks, { type: entry.fileType }));
-      inMemoryFiles.delete(pin);
-    } else {
-      // Fallback: empty file with correct metadata
-      downloadUrl = URL.createObjectURL(new Blob([new Uint8Array(0)], { type: entry.fileType }));
-    }
-  }
-
-  cb.onStage('Transfer Complete');
-  cb.onComplete(downloadUrl, entry.fileName, entry.fileSize);
-  await deleteTicket(pin);
-  return { endpointTicket: entry.ticket, pairingPin: pin, fileName: entry.fileName, fileSize: entry.fileSize, downloadUrl };
+  } catch { /* gone */ }
 }
 
-// --- Real Iroh transfers ---------------------------------------------------
+// --- Chunk upload/download --------------------------------------------------
 
-async function irohSend(file: File, pin: string, iroh: IrohModule, cb: TransferCallbacks): Promise<SenderSession> {
-  const endpoint = await iroh.Endpoint.bind({ alpns: [ALPN] });
-  const ticket = iroh.EndpointTicket.fromAddr(endpoint.addr()).toString();
-  await publishTicket(pin, ticket, { fileName: file.name, fileSize: file.size, fileType: file.type || 'application/octet-stream' });
-  cb.onStage('Waiting for Peer...');
+async function uploadChunks(pin: string, chunks: Uint8Array[], cb: TransferCallbacks, totalSize: number): Promise<void> {
+  if (!supabase) throw new Error('Supabase is not configured for cross-device transfers.');
 
-  const chunks = await fileToChunks(file);
-  let connectionClosed = false;
-
-  (async () => {
-    try {
-      const incoming = await endpoint.acceptNext();
-      const conn = await incoming.accept();
-      const bi = await conn.acceptBi();
-
-      cb.onStage('Actively Streaming Data');
-      let transferred = 0;
-      const startTime = Date.now();
-
-      for (const chunk of chunks) {
-        await bi.send.writeAll(chunk);
-        transferred += chunk.byteLength;
-        const elapsed = (Date.now() - startTime) / 1000;
-        cb.onProgress({
-          percent: Math.round((transferred / file.size) * 100),
-          bytesTransferred: transferred,
-          totalBytes: file.size,
-          speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-          eta: calcEta(file.size - transferred, transferred / Math.max(elapsed, 0.1)),
-        });
-      }
-      await bi.send.finish();
-      await bi.recv.stopped();
-      cb.onStage('Transfer Complete');
-      connectionClosed = true;
-      await conn.close();
-      await endpoint.close();
-      await deleteTicket(pin);
-    } catch (err) {
-      if (!connectionClosed) cb.onError(`Transfer failed: ${(err as Error).message}`);
-    }
-  })();
-
-  return { endpointTicket: ticket, pairingPin: pin, file };
-}
-
-async function irohReceive(pin: string, iroh: IrohModule, cb: TransferCallbacks): Promise<ReceiverSession> {
-  const entry = await resolveTicket(pin);
-  if (!entry) throw new Error('No active transfer found for that PIN. Check the code and try again.');
-
-  cb.onStage('Actively Streaming Data');
-  const endpoint = await iroh.Endpoint.bind();
-  const addr = iroh.EndpointTicket.fromString(entry.ticket).endpointAddr();
-  const conn = await endpoint.connect(addr, ALPN);
-  const bi = await conn.openBi();
-
-  const receivedChunks: Uint8Array[] = [];
   let transferred = 0;
   const startTime = Date.now();
 
-  for (;;) {
-    const data = await bi.recv.read(CHUNK_SIZE);
-    if (!data || (data as Uint8Array).byteLength === 0) break;
-    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-    receivedChunks.push(bytes);
-    transferred += bytes.byteLength;
+  for (let i = 0; i < chunks.length; i++) {
+    const b64 = uint8ArrayToBase64(chunks[i]);
+    const { error } = await supabase.from('transfer_chunks').insert({
+      pin,
+      chunk_index: i,
+      data: b64,
+    });
+    if (error) throw new Error(`Failed to upload chunk ${i}: ${error.message}`);
+
+    transferred += chunks[i].byteLength;
     const elapsed = (Date.now() - startTime) / 1000;
     cb.onProgress({
-      percent: entry.fileSize > 0 ? Math.round((transferred / entry.fileSize) * 100) : 0,
+      percent: Math.round((transferred / totalSize) * 100),
       bytesTransferred: transferred,
-      totalBytes: entry.fileSize,
+      totalBytes: totalSize,
       speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-      eta: calcEta(Math.max(0, entry.fileSize - transferred), transferred / Math.max(elapsed, 0.1)),
+      eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
     });
   }
-
-  await bi.send.finish();
-  await conn.close();
-  await endpoint.close();
-
-  const downloadUrl = bytesToBlobUrl(receivedChunks, entry.fileType);
-  cb.onStage('Transfer Complete');
-  cb.onComplete(downloadUrl, entry.fileName, entry.fileSize);
-  await deleteTicket(pin);
-  return { endpointTicket: entry.ticket, pairingPin: pin, fileName: entry.fileName, fileSize: entry.fileSize, downloadUrl };
 }
 
-// --- Public API -------------------------------------------------------------
+async function downloadChunks(pin: string, totalSize: number, fileType: string, cb: TransferCallbacks): Promise<string> {
+  // Try in-memory first (same device)
+  const stored = inMemoryFiles.get(pin);
+  if (stored) {
+    let transferred = 0;
+    const startTime = Date.now();
+    for (const chunk of stored.chunks) {
+      await new Promise((r) => setTimeout(r, 10));
+      transferred += chunk.byteLength;
+      const elapsed = (Date.now() - startTime) / 1000;
+      cb.onProgress({
+        percent: Math.round((transferred / totalSize) * 100),
+        bytesTransferred: transferred,
+        totalBytes: totalSize,
+        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+        eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
+      });
+    }
+    const url = URL.createObjectURL(new Blob(stored.chunks, { type: fileType }));
+    inMemoryFiles.delete(pin);
+    return url;
+  }
 
-const activeSenderSessions = new Map<string, SenderSession>();
+  if (!supabase) throw new Error('Supabase is not configured for cross-device transfers.');
+
+  // Poll for chunks from Supabase
+  const receivedChunks: Uint8Array[] = [];
+  let transferred = 0;
+  const startTime = Date.now();
+  let nextIndex = 0;
+  const totalChunks = Math.max(1, Math.ceil(totalSize / CHUNK_SIZE));
+
+  while (nextIndex < totalChunks) {
+    const { data, error } = await supabase
+      .from('transfer_chunks')
+      .select('chunk_index, data')
+      .eq('pin', pin)
+      .gte('chunk_index', nextIndex)
+      .order('chunk_index')
+      .limit(50);
+
+    if (error) throw new Error(`Failed to download chunks: ${error.message}`);
+    if (!data || data.length === 0) {
+      await new Promise((r) => setTimeout(r, POLL_CHUNK_INTERVAL_MS));
+      continue;
+    }
+
+    for (const row of data) {
+      if (row.chunk_index === nextIndex) {
+        const bytes = base64ToUint8Array(row.data);
+        receivedChunks.push(bytes);
+        transferred += bytes.byteLength;
+        nextIndex++;
+
+        const elapsed = (Date.now() - startTime) / 1000;
+        cb.onProgress({
+          percent: Math.round((transferred / totalSize) * 100),
+          bytesTransferred: transferred,
+          totalBytes: totalSize,
+          speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+          eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
+        });
+      }
+    }
+  }
+
+  return URL.createObjectURL(new Blob(receivedChunks, { type: fileType }));
+}
+
+// --- Chat -------------------------------------------------------------------
+
+let chatChannel: RealtimeChannel | null = null;
+
+export function joinChat(pin: string, role: 'sender' | 'receiver', callbacks: ChatCallbacks): void {
+  if (!supabase) return;
+
+  if (chatChannel) {
+    void supabase.removeChannel(chatChannel);
+    chatChannel = null;
+  }
+
+  chatChannel = supabase
+    .channel(`chat:${pin}`)
+    .on('postgres_changes', {
+      event: 'INSERT',
+      schema: 'public',
+      table: 'transfer_chat',
+      filter: `pin=eq.${pin}`,
+    }, (payload) => {
+      const row = payload.new as { id: string; pin: string; sender: string; message: string; created_at: string };
+      callbacks.onMessage({
+        id: String(row.id),
+        sender: row.sender as 'sender' | 'receiver',
+        message: row.message,
+        timestamp: new Date(row.created_at).getTime(),
+      });
+    })
+    .subscribe();
+}
+
+export async function sendChatMessage(pin: string, sender: 'sender' | 'receiver', message: string): Promise<void> {
+  const trimmed = message.trim().slice(0, MAX_MESSAGE_LENGTH);
+  if (!trimmed) return;
+
+  // In-memory fast path for same-device
+  const stored = inMemoryFiles.has(pin) || localStorage.getItem(STORAGE_PREFIX + pin);
+  if (stored && !supabase) return;
+
+  if (!supabase) return;
+
+  const { error } = await supabase.from('transfer_chat').insert({
+    pin,
+    sender,
+    message: trimmed,
+  });
+  if (error) throw new Error(`Failed to send message: ${error.message}`);
+}
+
+export async function loadChatHistory(pin: string): Promise<ChatMessage[]> {
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from('transfer_chat')
+    .select('id, sender, message, created_at')
+    .eq('pin', pin)
+    .order('created_at')
+    .limit(100);
+  if (error || !data) return [];
+  return data.map((row) => ({
+    id: String(row.id),
+    sender: row.sender as 'sender' | 'receiver',
+    message: row.message,
+    timestamp: new Date(row.created_at).getTime(),
+  }));
+}
+
+export function leaveChat(): void {
+  if (chatChannel && supabase) {
+    void supabase.removeChannel(chatChannel);
+    chatChannel = null;
+  }
+}
+
+// --- Public API: Sender ------------------------------------------------------
 
 export async function initSenderEngine(file: File, cb?: TransferCallbacks): Promise<SenderSession> {
   const cbs = cb ?? defaultCallbacks;
   const pin = generatePin();
   cbs.onStage('Hashing File');
 
-  const iroh = await loadIroh();
-  const session = iroh
-    ? await irohSend(file, pin, iroh, cbs)
-    : await simulatedSend(file, pin, cbs);
+  const meta: TransferMeta = { fileName: file.name, fileSize: file.size, fileType: file.type || 'application/octet-stream' };
+  const chunks = await fileToChunks(file);
 
+  // Store in memory for same-device fast path
+  inMemoryFiles.set(pin, { chunks, meta });
+
+  // Publish ticket (Supabase + localStorage)
+  await publishTicket(pin, meta);
+  cbs.onStage('Waiting for Peer...');
+
+  const session = { pairingPin: pin, file };
   activeSenderSessions.set(pin, session);
   return session;
 }
@@ -444,37 +418,61 @@ export async function streamSenderFile(pin: string, cb?: TransferCallbacks): Pro
   const cbs = cb ?? defaultCallbacks;
   const session = activeSenderSessions.get(pin);
   if (!session) return;
+
+  const stored = inMemoryFiles.get(pin);
+  if (!stored) return;
+
   cbs.onStage('Actively Streaming Data');
 
-  const iroh = await loadIroh();
-  if (iroh) return; // real Iroh streams automatically after acceptNext()
-
-  // Simulation: stream the file in chunks for the sender's UI
-  const file = session.file;
-  const chunks = await fileToChunks(file);
-  let transferred = 0;
-  const startTime = Date.now();
-
-  for (const chunk of chunks) {
-    await new Promise((r) => setTimeout(r, 30));
-    transferred += chunk.byteLength;
-    const elapsed = (Date.now() - startTime) / 1000;
-    cbs.onProgress({
-      percent: Math.round((transferred / file.size) * 100),
-      bytesTransferred: transferred,
-      totalBytes: file.size,
-      speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-      eta: calcEta(file.size - transferred, transferred / Math.max(elapsed, 0.1)),
-    });
+  // If Supabase is available, upload chunks for cross-device transfer
+  if (supabase) {
+    try {
+      await uploadChunks(pin, stored.chunks, cbs, stored.meta.fileSize);
+    } catch (error) {
+      cbs.onError((error as Error).message);
+      return;
+    }
+  } else {
+    // Same-device only: simulate progress
+    let transferred = 0;
+    const startTime = Date.now();
+    for (const chunk of stored.chunks) {
+      await new Promise((r) => setTimeout(r, 20));
+      transferred += chunk.byteLength;
+      const elapsed = (Date.now() - startTime) / 1000;
+      cbs.onProgress({
+        percent: Math.round((transferred / stored.meta.fileSize) * 100),
+        bytesTransferred: transferred,
+        totalBytes: stored.meta.fileSize,
+        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+        eta: calcEta(stored.meta.fileSize - transferred, transferred / Math.max(elapsed, 0.1)),
+      });
+    }
   }
 
   cbs.onStage('Transfer Complete');
   activeSenderSessions.delete(pin);
 }
 
+// --- Public API: Receiver ---------------------------------------------------
+
 export async function initReceiverEngine(pin: string, cb?: TransferCallbacks): Promise<ReceiverSession> {
   const cbs = cb ?? defaultCallbacks;
-  const iroh = await loadIroh();
-  if (iroh) return irohReceive(pin, iroh, cbs);
-  return simulatedReceive(pin, cbs);
+
+  const entry = await resolveTicket(pin);
+  if (!entry) throw new Error('No active transfer found for that PIN. Ask the sender to share their 6-digit code, then try again.');
+
+  cbs.onStage('Actively Streaming Data');
+
+  const downloadUrl = await downloadChunks(pin, entry.fileSize, entry.fileType, cbs);
+
+  cbs.onStage('Transfer Complete');
+  cbs.onComplete(downloadUrl, entry.fileName, entry.fileSize);
+  await deleteTicket(pin);
+
+  return { pairingPin: pin, fileName: entry.fileName, fileSize: entry.fileSize, downloadUrl };
+}
+
+export function isSupabaseConfigured(): boolean {
+  return supabase !== null;
 }
