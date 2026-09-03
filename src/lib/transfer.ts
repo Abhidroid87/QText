@@ -171,15 +171,18 @@ async function publishTicket(pin: string, ticket: string, meta: TransferMeta): P
   try { localStorage.setItem(key, JSON.stringify(entry)); } catch { /* quota */ }
 
   try {
-    if (!supabase) return;
-    await supabase.from('transfer_tickets').upsert({
+    if (!supabase) throw new Error('Supabase is not configured for cross-device transfers.');
+    const { error } = await supabase.from('transfer_tickets').upsert({
       pin,
       ticket,
       file_name: meta.fileName,
       file_size: meta.fileSize,
       file_type: meta.fileType,
     });
-  } catch { /* Supabase unreachable — localStorage still works same-device */ }
+    if (error) throw error;
+  } catch (error) {
+    throw new Error(`Could not publish transfer code: ${(error as Error).message}`);
+  }
 
   setTimeout(() => {
     try { localStorage.removeItem(key); } catch { /* gone */ }

@@ -162,9 +162,14 @@ function App() {
     setDownloadUrl('');
     setSecondsLeft(600);
     setStage('Hashing File');
-    const session = await initSenderEngine(nextFile, callbacksRef.current);
-    setPin(session.pairingPin);
-    setSenderSession(session);
+    try {
+      const session = await initSenderEngine(nextFile, callbacksRef.current);
+      setPin(session.pairingPin);
+      setSenderSession(session);
+    } catch (error) {
+      setErrorMessage((error as Error).message);
+      setStage('Idle');
+    }
   };
 
   const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
