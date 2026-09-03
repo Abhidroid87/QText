@@ -32,16 +32,21 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         run: |
-          test -n "$VITE_SUPABASE_URL"
-          test -n "$VITE_SUPABASE_ANON_KEY"
-          case "$VITE_SUPABASE_URL" in
-            http://*|https://*) ;;
-            *) echo "VITE_SUPABASE_URL must be an HTTP(S) URL"; exit 1 ;;
-          esac
+          node <<'NODE'
+          const fs = require('fs');
+          const clean = (value) => value.trim().replace(/^(?:"|')|(?:"|')$/g, '');
+          const url = clean(process.env.VITE_SUPABASE_URL || '');
+          const key = clean(process.env.VITE_SUPABASE_ANON_KEY || '');
+          if (!url || !key) throw new Error('Both Supabase secrets are required');
+          try {
+            const parsed = new URL(url);
+            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
+          } catch {
+            throw new Error('VITE_SUPABASE_URL must be a valid HTTP(S) URL');
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `VITE_SUPABASE_URL=${url}\nVITE_SUPABASE_ANON_KEY=${key}\n`);
+          NODE
       - name: Build
-        env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         run: npm run build
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
