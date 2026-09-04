@@ -1,32 +1,49 @@
 /**
- * Peer-to-peer transfer engine for Meshdrop.
+ * Room-based transfer engine for Meshdrop.
  *
- * Transport strategy:
- *   1. Same-device fast path (in-memory, when sender+receiver share a browser)
- *   2. Supabase chunk relay (primary cross-device transport — works on any
- *      static host including GitHub Pages, only needs the Supabase REST API)
+ * Flow:
+ *   1. User clicks "Send" or "Receive" → a room is created with a 6-digit PIN + QR
+ *   2. Others join the room via PIN or QR scan
+ *   3. Inside the room: chat + file sharing, all in one unified conversation view
+ *   4. Multiple people can join the same room
  *
- * Connection-first flow (auto-start, no button click needed on sender side):
- *   1. Sender selects file → publishes ticket → immediately starts watching
- *   2. Receiver enters PIN → resolves ticket → signals "connected"
- *   3. Sender detects receiver → acks → starts uploading chunks
- *   4. Receiver detects ack → starts polling for chunks
- *   5. Sender finishes upload → signals "chunks_ready"
- *   6. Receiver collects all chunks → assembles file → download ready
+ * Transport:
+ *   - Chat messages: Supabase `transfer_chat` table + Realtime
+ *   - File data: Supabase `transfer_chunks` relay (works on any static host)
+ *   - Presence: `room_members` table + Realtime
+ *   - File metadata: `file_offers` table
  */
 
 import { createClient, type RealtimeChannel } from '@supabase/supabase-js';
 
 // --- Types ------------------------------------------------------------------
 
-export type TransferStage =
-  | 'Idle'
-  | 'Hashing File'
-  | 'Waiting for Peer...'
-  | 'Connecting...'
-  | 'Connected'
-  | 'Actively Streaming Data'
-  | 'Transfer Complete';
+export type RoomMember = {
+  member_id: string;
+  display_name: string;
+  role: 'host' | 'member';
+  is_online: boolean;
+};
+
+export type ChatMessage = {
+  id: string;
+  sender: 'sender' | 'receiver' | 'system';
+  sender_name: string;
+  message: string;
+  timestamp: number;
+};
+
+export type FileOffer = {
+  file_id: string;
+  file_name: string;
+  file_size: number;
+  file_type: string;
+  sender_id: string;
+  sender_name: string;
+  status: 'offered' | 'uploading' | 'ready' | 'downloading' | 'done';
+  total_chunks: number;
+  created_at: number;
+};
 
 export type TransferProgress = {
   percent: number;
@@ -36,53 +53,23 @@ export type TransferProgress = {
   eta: number;
 };
 
-export type TransferCallbacks = {
-  onStage: (stage: TransferStage) => void;
-  onProgress: (progress: TransferProgress) => void;
-  onComplete: (downloadUrl: string, fileName: string, fileSize: number) => void;
+export type RoomCallbacks = {
+  onMembersChange: (members: RoomMember[]) => void;
+  onChatMessage: (msg: ChatMessage) => void;
+  onFileOffer: (offer: FileOffer) => void;
+  onFileOfferUpdate: (offer: FileOffer) => void;
+  onProgress: (fileId: string, progress: TransferProgress) => void;
   onError: (message: string) => void;
 };
-
-export type ChatMessage = {
-  id: string;
-  sender: 'sender' | 'receiver';
-  message: string;
-  timestamp: number;
-};
-
-export type ChatCallbacks = {
-  onMessage: (msg: ChatMessage) => void;
-};
-
-export type SenderSession = {
-  pairingPin: string;
-  file: File;
-};
-
-export type ReceiverSession = {
-  pairingPin: string;
-  fileName: string;
-  fileSize: number;
-  downloadUrl: string;
-};
-
-type TransferMeta = { fileName: string; fileSize: number; fileType: string };
-type TicketEntry = TransferMeta & { ticket: string };
 
 // --- Constants --------------------------------------------------------------
 
 const TICKET_TTL_MS = 10 * 60 * 1000;
 const STORAGE_PREFIX = 'meshdrop-pin-';
-const CHUNK_SIZE = 256 * 1024; // 256KB per chunk for Supabase relay
-const RESOLVE_TIMEOUT_MS = 120_000; // 2 minutes to find a PIN
-const RESOLVE_POLL_MS = 1000;
-const SENDER_WATCH_TIMEOUT_MS = 10 * 60 * 1000; // Sender waits up to ticket TTL
-const SENDER_WATCH_POLL_MS = 1000;
-const RECEIVER_ACK_TIMEOUT_MS = 60_000; // Receiver waits 60s for sender ack
-const RECEIVER_ACK_POLL_MS = 500;
-const CHUNK_POLL_MS = 300;
-const RECEIVE_TIMEOUT_MS = 10 * 60 * 1000; // 10 min max for receiving all chunks
+const CHUNK_SIZE = 256 * 1024;
 const MAX_MESSAGE_LENGTH = 1000;
+const PRESENCE_INTERVAL_MS = 5000;
+const PRESENCE_TIMEOUT_MS = 15000;
 
 // --- Supabase client --------------------------------------------------------
 
@@ -99,6 +86,16 @@ const supabase = supabaseUrl && supabaseAnonKey && /^https?:\/\//i.test(supabase
 
 function generatePin(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function generateId(): string {
+  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+function generateName(): string {
+  const adjectives = ['Swift', 'Bright', 'Calm', 'Bold', 'Quick', 'Wild', 'Cool', 'Warm'];
+  const nouns = ['Falcon', 'River', 'Comet', 'Wolf', 'Star', 'Oak', 'Lynx', 'Drift'];
+  return `${adjectives[Math.floor(Math.random() * adjectives.length)]} ${nouns[Math.floor(Math.random() * nouns.length)]}`;
 }
 
 function formatSpeed(bytesPerSec: number): number {
@@ -127,651 +124,489 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-async function fileToChunks(file: File, size: number): Promise<ArrayBuffer[]> {
+async function fileToChunks(file: File): Promise<ArrayBuffer[]> {
   const chunks: ArrayBuffer[] = [];
-  for (let offset = 0; offset < file.size; offset += size) {
-    const buf = await file.slice(offset, offset + size).arrayBuffer();
+  for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
+    const buf = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
     chunks.push(buf);
   }
   return chunks;
 }
 
-const defaultCallbacks: TransferCallbacks = {
-  onStage: () => {},
-  onProgress: () => {},
-  onComplete: () => {},
-  onError: () => {},
-};
-
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// --- In-memory store (same-device fast path) --------------------------------
+// --- Room state --------------------------------------------------------------
 
-const inMemoryFiles = new Map<string, { chunks: ArrayBuffer[]; meta: TransferMeta }>();
-const activeSenderSessions = new Map<string, SenderSession>();
-const cancelledPins = new Set<string>();
+let currentPin: string | null = null;
+let currentMemberId: string | null = null;
+let currentDisplayName: string | null = null;
+let currentRole: 'host' | 'member' = 'member';
+let roomChannel: RealtimeChannel | null = null;
+let chatChannel: RealtimeChannel | null = null;
+let presenceTimer: number | null = null;
+let callbacksRef: RoomCallbacks | null = null;
 
-// --- PIN → Ticket store (Supabase + localStorage) ---------------------------
+// --- Public API: Room management --------------------------------------------
 
-async function publishTicket(pin: string, meta: TransferMeta): Promise<void> {
-  const entry = {
-    ticket: `mem:${pin}`,
-    fileName: meta.fileName,
-    fileSize: String(meta.fileSize),
-    fileType: meta.fileType,
-    ts: String(Date.now()),
-  };
-  const key = STORAGE_PREFIX + pin;
+export function isSupabaseConfigured(): boolean {
+  return supabase !== null;
+}
+
+export function getCurrentMemberId(): string | null {
+  return currentMemberId;
+}
+
+export function getCurrentDisplayName(): string | null {
+  return currentDisplayName;
+}
+
+export async function createRoom(cb: RoomCallbacks): Promise<string> {
+  const pin = generatePin();
+  currentPin = pin;
+  currentMemberId = generateId();
+  currentDisplayName = generateName();
+  currentRole = 'host';
+  callbacksRef = cb;
+
+  // Store locally for same-device fast path
   try {
-    localStorage.setItem(key, JSON.stringify(entry));
-  } catch {
-    /* quota */
+    localStorage.setItem(STORAGE_PREFIX + pin, JSON.stringify({ pin, ts: Date.now() }));
+  } catch { /* quota */ }
+
+  // Publish ticket in Supabase
+  if (supabase) {
+    try {
+      await supabase.from('transfer_tickets').upsert({
+        pin,
+        ticket: `room:${pin}`,
+        file_name: '',
+        file_size: 0,
+        file_type: '',
+        receiver_status: 'waiting',
+        sender_status: 'ready',
+      });
+    } catch (error) {
+      console.warn('Could not publish room to Supabase:', (error as Error).message);
+    }
   }
 
-  try {
-    if (!supabase) return;
-    await supabase.from('transfer_tickets').upsert({
-      pin,
-      ticket: `supa:${pin}`,
-      file_name: meta.fileName,
-      file_size: meta.fileSize,
-      file_type: meta.fileType,
-      receiver_status: 'waiting',
-      sender_status: 'ready',
-    });
-  } catch (error) {
-    console.warn('Could not publish to Supabase (cross-device may fail):', (error as Error).message);
-  }
+  // Register as room member
+  await joinRoomMember(pin, currentMemberId, currentDisplayName, 'host');
 
+  // Start listening
+  startRoomListeners(pin, cb);
+  startPresence(pin);
+
+  // Auto-cleanup after TTL
   setTimeout(() => {
-    try {
-      localStorage.removeItem(key);
-    } catch {
-      /* gone */
-    }
-    if (supabase) {
-      void supabase.from('transfer_tickets').delete().eq('pin', pin);
-      void supabase.from('transfer_chunks').delete().eq('pin', pin);
-      void supabase.from('transfer_chat').delete().eq('pin', pin);
-    }
+    if (currentPin === pin) leaveRoom();
   }, TICKET_TTL_MS);
+
+  return pin;
 }
 
-async function resolveTicket(pin: string): Promise<TicketEntry | null> {
-  const key = STORAGE_PREFIX + pin;
+export async function joinRoom(pin: string, cb: RoomCallbacks): Promise<void> {
+  currentPin = pin;
+  currentMemberId = generateId();
+  currentDisplayName = generateName();
+  currentRole = 'member';
+  callbacksRef = cb;
 
-  // Same-device fast path
-  try {
-    const raw = localStorage.getItem(key);
-    if (raw) {
-      const data = JSON.parse(raw) as {
-        ticket: string;
-        fileName: string;
-        fileSize: string;
-        fileType?: string;
-      };
-      if (data.ticket) {
-        return {
-          ticket: data.ticket,
-          fileName: data.fileName,
-          fileSize: parseInt(data.fileSize || '0', 10),
-          fileType: data.fileType || 'application/octet-stream',
-        };
-      }
+  // Check if room exists
+  if (supabase) {
+    const { data, error } = await supabase
+      .from('transfer_tickets')
+      .select('pin')
+      .eq('pin', pin)
+      .maybeSingle();
+
+    if (error || !data) {
+      throw new Error('No active room found for that code. Ask the host to share their 6-digit code, then try again.');
     }
-  } catch {
-    /* parse error */
   }
 
-  if (!supabase) return null;
-
-  const deadline = Date.now() + RESOLVE_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    try {
-      const { data, error } = await supabase
-        .from('transfer_tickets')
-        .select('pin, ticket, file_name, file_size, file_type')
-        .eq('pin', pin)
-        .maybeSingle();
-
-      if (error) throw error;
-      if (data) {
-        return {
-          ticket: data.ticket,
-          fileName: data.file_name,
-          fileSize: data.file_size,
-          fileType: data.file_type || 'application/octet-stream',
-        };
-      }
-    } catch {
-      /* network blip — keep polling */
-    }
-    await sleep(RESOLVE_POLL_MS);
+  // Check same-device
+  const local = localStorage.getItem(STORAGE_PREFIX + pin);
+  if (!local && !supabase) {
+    throw new Error('No active room found for that code.');
   }
 
-  return null;
+  await joinRoomMember(pin, currentMemberId, currentDisplayName, 'member');
+  startRoomListeners(pin, cb);
+  startPresence(pin);
+
+  // Send system message
+  await sendSystemMessage(pin, `${currentDisplayName} joined the room`);
 }
 
-async function deleteTicket(pin: string): Promise<void> {
-  try {
-    localStorage.removeItem(STORAGE_PREFIX + pin);
-  } catch {
-    /* gone */
-  }
-  try {
-    if (supabase) {
-      await supabase.from('transfer_tickets').delete().eq('pin', pin);
-      await supabase.from('transfer_chunks').delete().eq('pin', pin);
-      await supabase.from('transfer_chat').delete().eq('pin', pin);
-    }
-  } catch {
-    /* gone */
-  }
-}
-
-// --- Connection Handshake ---------------------------------------------------
-//
-// Uses `receiver_status` and `sender_status` columns on transfer_tickets:
-//   1. Receiver resolves PIN → sets receiver_status = 'connected'
-//   2. Sender detects receiver_status = 'connected' → sets sender_status = 'ack'
-//   3. Receiver detects sender_status = 'ack' → connection confirmed
-//
-// The sender starts watching IMMEDIATELY after publishing the ticket
-// (auto-start, no button click needed). This eliminates the race condition
-// where the receiver signals before the sender is watching.
-
-async function receiverSignalConnected(pin: string): Promise<void> {
+export async function joinRoomMember(pin: string, memberId: string, name: string, role: 'host' | 'member'): Promise<void> {
   if (!supabase) return;
   try {
-    await supabase
-      .from('transfer_tickets')
-      .update({ receiver_status: 'connected' })
-      .eq('pin', pin);
-  } catch {
-    /* non-fatal */
-  }
-}
-
-async function senderAckConnected(pin: string): Promise<void> {
-  if (!supabase) return;
-  try {
-    await supabase
-      .from('transfer_tickets')
-      .update({ sender_status: 'ack' })
-      .eq('pin', pin);
-  } catch {
-    /* non-fatal */
-  }
-}
-
-// --- Supabase Chunk Relay (primary transport) -------------------------------
-
-async function sendViaSupabaseChunks(
-  pin: string,
-  file: File,
-  chunks: ArrayBuffer[],
-  cb: TransferCallbacks,
-): Promise<void> {
-  if (!supabase) throw new Error('Supabase is not configured');
-
-  cb.onStage('Actively Streaming Data');
-  let transferred = 0;
-  const startTime = Date.now();
-
-  for (let i = 0; i < chunks.length; i++) {
-    if (cancelledPins.has(pin)) {
-      throw new Error('Transfer cancelled');
-    }
-
-    const b64 = arrayBufferToBase64(chunks[i]);
-    let retries = 0;
-    const maxRetries = 5;
-
-    while (retries < maxRetries) {
-      try {
-        const { error } = await supabase.from('transfer_chunks').insert({
-          pin,
-          chunk_index: i,
-          data: b64,
-        });
-        if (error) throw error;
-        break;
-      } catch (err) {
-        retries++;
-        if (retries >= maxRetries) {
-          throw new Error(
-            `Failed to upload chunk ${i}: ${(err as Error).message}`,
-          );
-        }
-        await sleep(1000 * retries);
-      }
-    }
-
-    transferred += chunks[i].byteLength;
-    const elapsed = (Date.now() - startTime) / 1000;
-    cb.onProgress({
-      percent: Math.round((transferred / file.size) * 100),
-      bytesTransferred: transferred,
-      totalBytes: file.size,
-      speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-      eta: calcEta(file.size - transferred, transferred / Math.max(elapsed, 0.1)),
+    await supabase.from('room_members').upsert({
+      pin,
+      member_id: memberId,
+      display_name: name,
+      role,
+      last_seen: new Date().toISOString(),
     });
-  }
-
-  // Signal that all chunks are uploaded
-  await supabase
-    .from('transfer_tickets')
-    .update({ sender_status: 'chunks_ready' })
-    .eq('pin', pin);
-
-  cb.onStage('Transfer Complete');
+  } catch { /* non-fatal */ }
 }
 
-async function receiveViaSupabaseChunks(
-  pin: string,
-  totalSize: number,
-  fileType: string,
-  cb: TransferCallbacks,
-): Promise<string> {
-  if (!supabase) throw new Error('Supabase is not configured');
-
-  cb.onStage('Actively Streaming Data');
-
-  const receivedChunks: ArrayBuffer[] = [];
-  let transferred = 0;
-  const startTime = Date.now();
-  const expectedChunks = Math.ceil(totalSize / CHUNK_SIZE);
-
-  // Poll for chunks until we have them all
-  let nextIndex = 0;
-  const pollDeadline = Date.now() + RECEIVE_TIMEOUT_MS;
-
-  while (nextIndex < expectedChunks && Date.now() < pollDeadline) {
-    if (cancelledPins.has(pin)) {
-      throw new Error('Transfer cancelled');
+export function leaveRoom(): void {
+  if (currentPin && currentMemberId && supabase) {
+    void supabase.from('room_members').delete().eq('pin', currentPin).eq('member_id', currentMemberId);
+    if (currentDisplayName) {
+      void sendSystemMessage(currentPin, `${currentDisplayName} left the room`);
     }
+  }
+  if (roomChannel && supabase) {
+    void supabase.removeChannel(roomChannel);
+    roomChannel = null;
+  }
+  if (chatChannel && supabase) {
+    void supabase.removeChannel(chatChannel);
+    chatChannel = null;
+  }
+  if (presenceTimer) {
+    window.clearInterval(presenceTimer);
+    presenceTimer = null;
+  }
+  currentPin = null;
+  currentMemberId = null;
+  currentDisplayName = null;
+  callbacksRef = null;
+}
 
+// --- Presence ---------------------------------------------------------------
+
+function startPresence(pin: string): void {
+  if (presenceTimer) window.clearInterval(presenceTimer);
+  presenceTimer = window.setInterval(async () => {
+    if (!supabase || !currentMemberId || !currentPin) return;
     try {
-      const { data, error } = await supabase
-        .from('transfer_chunks')
-        .select('chunk_index, data')
-        .eq('pin', pin)
-        .eq('chunk_index', nextIndex)
-        .maybeSingle();
+      await supabase.from('room_members')
+        .update({ last_seen: new Date().toISOString() })
+        .eq('pin', currentPin)
+        .eq('member_id', currentMemberId);
+    } catch { /* non-fatal */ }
+    await refreshMembers(currentPin);
+  }, PRESENCE_INTERVAL_MS);
+  // Initial fetch
+  void refreshMembers(pin);
+}
 
-      if (error) throw error;
+async function refreshMembers(pin: string): Promise<void> {
+  if (!supabase || !callbacksRef) return;
+  try {
+    const { data } = await supabase
+      .from('room_members')
+      .select('member_id, display_name, role, last_seen')
+      .eq('pin', pin);
+    if (!data) return;
 
-      if (data) {
-        const buf = base64ToArrayBuffer(data.data);
-        receivedChunks.push(buf);
-        transferred += buf.byteLength;
-        nextIndex++;
+    const now = Date.now();
+    const members: RoomMember[] = data.map((row) => ({
+      member_id: row.member_id,
+      display_name: row.display_name,
+      role: row.role as 'host' | 'member',
+      is_online: now - new Date(row.last_seen).getTime() < PRESENCE_TIMEOUT_MS,
+    }));
+    callbacksRef.onMembersChange(members);
+  } catch { /* non-fatal */ }
+}
 
-        const elapsed = (Date.now() - startTime) / 1000;
-        cb.onProgress({
-          percent: Math.round((transferred / totalSize) * 100),
-          bytesTransferred: transferred,
-          totalBytes: totalSize,
-          speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-          eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
-        });
-      } else {
-        await sleep(CHUNK_POLL_MS);
-      }
-    } catch {
-      await sleep(500);
-    }
-  }
+// --- Realtime listeners -----------------------------------------------------
 
-  if (nextIndex < expectedChunks) {
-    throw new Error('Transfer timed out — not all file chunks were received. Ask the sender to try again.');
-  }
+function startRoomListeners(pin: string, cb: RoomCallbacks): void {
+  if (!supabase) return;
 
-  const url = URL.createObjectURL(new Blob(receivedChunks, { type: fileType }));
-  cb.onStage('Transfer Complete');
-  return url;
+  // Chat channel
+  if (chatChannel) void supabase.removeChannel(chatChannel);
+  chatChannel = supabase
+    .channel(`chat:${pin}`)
+    .on('postgres_changes', {
+      event: 'INSERT',
+      schema: 'public',
+      table: 'transfer_chat',
+      filter: `pin=eq.${pin}`,
+    }, (payload) => {
+      const row = payload.new as { id: string; sender: string; sender_name: string; message: string; created_at: string };
+      cb.onChatMessage({
+        id: String(row.id),
+        sender: row.sender as ChatMessage['sender'],
+        sender_name: row.sender_name || 'Anonymous',
+        message: row.message,
+        timestamp: new Date(row.created_at).getTime(),
+      });
+    })
+    .subscribe();
+
+  // File offers + members channel
+  if (roomChannel) void supabase.removeChannel(roomChannel);
+  roomChannel = supabase
+    .channel(`room:${pin}`)
+    .on('postgres_changes', {
+      event: 'INSERT',
+      schema: 'public',
+      table: 'file_offers',
+      filter: `pin=eq.${pin}`,
+    }, (payload) => {
+      const row = payload.new as { file_id: string; file_name: string; file_size: number; file_type: string; sender_id: string; sender_name: string; status: string; total_chunks: number; created_at: string };
+      cb.onFileOffer({
+        file_id: row.file_id,
+        file_name: row.file_name,
+        file_size: row.file_size,
+        file_type: row.file_type,
+        sender_id: row.sender_id,
+        sender_name: row.sender_name,
+        status: row.status as FileOffer['status'],
+        total_chunks: row.total_chunks,
+        created_at: new Date(row.created_at).getTime(),
+      });
+    })
+    .on('postgres_changes', {
+      event: 'UPDATE',
+      schema: 'public',
+      table: 'file_offers',
+      filter: `pin=eq.${pin}`,
+    }, (payload) => {
+      const row = payload.new as { file_id: string; file_name: string; file_size: number; file_type: string; sender_id: string; sender_name: string; status: string; total_chunks: number; created_at: string };
+      cb.onFileOfferUpdate({
+        file_id: row.file_id,
+        file_name: row.file_name,
+        file_size: row.file_size,
+        file_type: row.file_type,
+        sender_id: row.sender_id,
+        sender_name: row.sender_name,
+        status: row.status as FileOffer['status'],
+        total_chunks: row.total_chunks,
+        created_at: new Date(row.created_at).getTime(),
+      });
+    })
+    .on('postgres_changes', {
+      event: 'INSERT',
+      schema: 'public',
+      table: 'room_members',
+      filter: `pin=eq.${pin}`,
+    }, () => { void refreshMembers(pin); })
+    .on('postgres_changes', {
+      event: 'DELETE',
+      schema: 'public',
+      table: 'room_members',
+      filter: `pin=eq.${pin}`,
+    }, () => { void refreshMembers(pin); })
+    .on('postgres_changes', {
+      event: 'UPDATE',
+      schema: 'public',
+      table: 'room_members',
+      filter: `pin=eq.${pin}`,
+    }, () => { void refreshMembers(pin); })
+    .subscribe();
+
+  // Load initial data
+  void loadChatHistory(pin).then((msgs) => msgs.forEach((m) => cb.onChatMessage(m)));
+  void loadFileOffers(pin).then((offers) => offers.forEach((o) => cb.onFileOffer(o)));
 }
 
 // --- Chat -------------------------------------------------------------------
 
-let chatChannel: RealtimeChannel | null = null;
-
-export function joinChat(
-  pin: string,
-  role: 'sender' | 'receiver',
-  callbacks: ChatCallbacks,
-): void {
-  if (!supabase) return;
-
-  if (chatChannel) {
-    void supabase.removeChannel(chatChannel);
-    chatChannel = null;
-  }
-
-  chatChannel = supabase
-    .channel(`chat:${pin}`)
-    .on(
-      'postgres_changes',
-      {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'transfer_chat',
-        filter: `pin=eq.${pin}`,
-      },
-      (payload) => {
-        const row = payload.new as {
-          id: string;
-          pin: string;
-          sender: string;
-          message: string;
-          created_at: string;
-        };
-        callbacks.onMessage({
-          id: String(row.id),
-          sender: row.sender as 'sender' | 'receiver',
-          message: row.message,
-          timestamp: new Date(row.created_at).getTime(),
-        });
-      },
-    )
-    .subscribe();
-}
-
-export async function sendChatMessage(
-  pin: string,
-  sender: 'sender' | 'receiver',
-  message: string,
-): Promise<void> {
+export async function sendChatMessage(message: string): Promise<void> {
+  if (!supabase || !currentPin || !currentMemberId || !currentDisplayName) return;
   const trimmed = message.trim().slice(0, MAX_MESSAGE_LENGTH);
   if (!trimmed) return;
-  if (!supabase) return;
 
   const { error } = await supabase.from('transfer_chat').insert({
-    pin,
-    sender,
+    pin: currentPin,
+    sender: currentRole === 'host' ? 'sender' : 'receiver',
+    sender_name: currentDisplayName,
     message: trimmed,
   });
   if (error) throw new Error(`Failed to send message: ${error.message}`);
+}
+
+async function sendSystemMessage(pin: string, message: string): Promise<void> {
+  if (!supabase) return;
+  try {
+    await supabase.from('transfer_chat').insert({
+      pin,
+      sender: 'system',
+      sender_name: 'System',
+      message,
+    });
+  } catch { /* non-fatal */ }
 }
 
 export async function loadChatHistory(pin: string): Promise<ChatMessage[]> {
   if (!supabase) return [];
   const { data, error } = await supabase
     .from('transfer_chat')
-    .select('id, sender, message, created_at')
+    .select('id, sender, sender_name, message, created_at')
     .eq('pin', pin)
     .order('created_at')
-    .limit(100);
+    .limit(200);
   if (error || !data) return [];
   return data.map((row) => ({
     id: String(row.id),
-    sender: row.sender as 'sender' | 'receiver',
+    sender: row.sender as ChatMessage['sender'],
+    sender_name: row.sender_name || 'Anonymous',
     message: row.message,
     timestamp: new Date(row.created_at).getTime(),
   }));
 }
 
-export function leaveChat(): void {
-  if (chatChannel && supabase) {
-    void supabase.removeChannel(chatChannel);
-    chatChannel = null;
+// --- File sharing -----------------------------------------------------------
+
+export async function loadFileOffers(pin: string): Promise<FileOffer[]> {
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from('file_offers')
+    .select('file_id, file_name, file_size, file_type, sender_id, sender_name, status, total_chunks, created_at')
+    .eq('pin', pin)
+    .order('created_at');
+  if (error || !data) return [];
+  return data.map((row) => ({
+    file_id: row.file_id,
+    file_name: row.file_name,
+    file_size: row.file_size,
+    file_type: row.file_type,
+    sender_id: row.sender_id,
+    sender_name: row.sender_name,
+    status: row.status as FileOffer['status'],
+    total_chunks: row.total_chunks,
+    created_at: new Date(row.created_at).getTime(),
+  }));
+}
+
+export async function shareFile(file: File): Promise<string> {
+  if (!supabase || !currentPin || !currentMemberId || !currentDisplayName) {
+    throw new Error('You must be in a room to share a file');
   }
+
+  const fileId = generateId();
+  const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+
+  // Create file offer
+  const { error } = await supabase.from('file_offers').insert({
+    pin: currentPin,
+    file_id: fileId,
+    file_name: file.name,
+    file_size: file.size,
+    file_type: file.type || 'application/octet-stream',
+    sender_id: currentMemberId,
+    sender_name: currentDisplayName,
+    status: 'uploading',
+    total_chunks: totalChunks,
+  });
+  if (error) throw new Error(`Failed to create file offer: ${error.message}`);
+
+  // Upload chunks in background
+  const chunks = await fileToChunks(file);
+  void uploadFileChunks(currentPin, fileId, chunks, file.size);
+
+  return fileId;
 }
 
-// --- Public API: Sender ------------------------------------------------------
+async function uploadFileChunks(pin: string, fileId: string, chunks: ArrayBuffer[], totalSize: number): Promise<void> {
+  if (!supabase || !callbacksRef) return;
 
-export async function initSenderEngine(
-  file: File,
-  cb?: TransferCallbacks,
-): Promise<SenderSession> {
-  const cbs = cb ?? defaultCallbacks;
-  const pin = generatePin();
-  cbs.onStage('Hashing File');
+  let transferred = 0;
+  const startTime = Date.now();
 
-  const meta: TransferMeta = {
-    fileName: file.name,
-    fileSize: file.size,
-    fileType: file.type || 'application/octet-stream',
-  };
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      const b64 = arrayBufferToBase64(chunks[i]);
+      let retries = 0;
+      const maxRetries = 5;
 
-  const chunks = await fileToChunks(file, CHUNK_SIZE);
-  inMemoryFiles.set(pin, { chunks, meta });
+      while (retries < maxRetries) {
+        const { error } = await supabase.from('transfer_chunks').insert({
+          pin,
+          chunk_index: i,
+          data: b64,
+          file_id: fileId,
+        });
+        if (!error) break;
+        retries++;
+        if (retries >= maxRetries) throw new Error(`Failed to upload chunk ${i}: ${error.message}`);
+        await sleep(1000 * retries);
+      }
 
-  await publishTicket(pin, meta);
-  cbs.onStage('Waiting for Peer...');
-
-  const session = { pairingPin: pin, file };
-  activeSenderSessions.set(pin, session);
-  return session;
-}
-
-/**
- * Auto-starts the sender's watch for a receiver. Polls the ticket's
- * receiver_status until it becomes 'connected', then acks and begins
- * uploading chunks. This runs in the background — no user interaction needed.
- */
-export async function startSenderWatch(
-  pin: string,
-  cb?: TransferCallbacks,
-): Promise<void> {
-  const cbs = cb ?? defaultCallbacks;
-  const session = activeSenderSessions.get(pin);
-  if (!session) return;
-
-  const stored = inMemoryFiles.get(pin);
-  if (!stored) return;
-
-  // Same-device fast path: in-memory, no network needed
-  if (inMemoryFiles.has(pin) && localStorage.getItem(STORAGE_PREFIX + pin)) {
-    cbs.onStage('Actively Streaming Data');
-    let transferred = 0;
-    const startTime = Date.now();
-    for (const chunk of stored.chunks) {
-      if (cancelledPins.has(pin)) return;
-      await sleep(5);
-      transferred += chunk.byteLength;
+      transferred += chunks[i].byteLength;
       const elapsed = (Date.now() - startTime) / 1000;
-      cbs.onProgress({
-        percent: Math.round((transferred / stored.meta.fileSize) * 100),
+      callbacksRef.onProgress(fileId, {
+        percent: Math.round((transferred / totalSize) * 100),
         bytesTransferred: transferred,
-        totalBytes: stored.meta.fileSize,
+        totalBytes: totalSize,
         speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-        eta: calcEta(
-          stored.meta.fileSize - transferred,
-          transferred / Math.max(elapsed, 0.1),
-        ),
+        eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
       });
-    }
-    cbs.onStage('Transfer Complete');
-    activeSenderSessions.delete(pin);
-    return;
-  }
-
-  if (!supabase) {
-    cbs.onError('Cannot transfer cross-device without Supabase configuration');
-    return;
-  }
-
-  // --- Wait for receiver to connect ---
-  cbs.onStage('Waiting for Peer...');
-
-  const watchDeadline = Date.now() + SENDER_WATCH_TIMEOUT_MS;
-  let receiverConnected = false;
-
-  while (Date.now() < watchDeadline) {
-    if (cancelledPins.has(pin)) {
-      cbs.onStage('Idle');
+    } catch (error) {
+      // Mark offer as failed
+      await supabase.from('file_offers').update({ status: 'offered' }).eq('file_id', fileId).eq('pin', pin);
+      callbacksRef.onError(`Upload failed: ${(error as Error).message}`);
       return;
     }
+  }
 
-    // Check same-device fast path
-    if (inMemoryFiles.has(pin) && localStorage.getItem(STORAGE_PREFIX + pin)) {
-      receiverConnected = true;
-      break;
-    }
+  // Mark as ready
+  await supabase.from('file_offers').update({ status: 'ready' }).eq('file_id', fileId).eq('pin', pin);
+}
 
-    try {
+export async function downloadFile(offer: FileOffer): Promise<string> {
+  if (!supabase) throw new Error('Supabase is not configured');
+
+  // Update status
+  await supabase.from('file_offers').update({ status: 'downloading' }).eq('file_id', offer.file_id).eq('pin', currentPin!);
+
+  const receivedChunks: ArrayBuffer[] = [];
+  let transferred = 0;
+  const startTime = Date.now();
+  const expectedChunks = offer.total_chunks;
+
+  for (let i = 0; i < expectedChunks; i++) {
+    let retries = 0;
+    const maxRetries = 60; // Wait up to 30s per chunk
+
+    while (retries < maxRetries) {
       const { data, error } = await supabase
-        .from('transfer_tickets')
-        .select('receiver_status')
-        .eq('pin', pin)
+        .from('transfer_chunks')
+        .select('data')
+        .eq('pin', currentPin!)
+        .eq('file_id', offer.file_id)
+        .eq('chunk_index', i)
         .maybeSingle();
 
-      if (!error && data?.receiver_status === 'connected') {
-        receiverConnected = true;
+      if (error) throw error;
+      if (data) {
+        const buf = base64ToArrayBuffer(data.data as string);
+        receivedChunks.push(buf);
+        transferred += buf.byteLength;
+
+        if (callbacksRef) {
+          const elapsed = (Date.now() - startTime) / 1000;
+          callbacksRef.onProgress(offer.file_id, {
+            percent: Math.round((transferred / offer.file_size) * 100),
+            bytesTransferred: transferred,
+            totalBytes: offer.file_size,
+            speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
+            eta: calcEta(offer.file_size - transferred, transferred / Math.max(elapsed, 0.1)),
+          });
+        }
         break;
       }
-    } catch {
-      /* keep polling */
+      retries++;
+      await sleep(500);
     }
 
-    await sleep(SENDER_WATCH_POLL_MS);
-  }
-
-  if (!receiverConnected) {
-    if (!cancelledPins.has(pin)) {
-      cbs.onError('No receiver connected within the timeout. The pairing code has expired.');
-    }
-    return;
-  }
-
-  // Ack the receiver
-  await senderAckConnected(pin);
-  cbs.onStage('Connected');
-
-  // Small delay to let receiver see the ack before we start uploading
-  await sleep(500);
-
-  // Start uploading chunks
-  try {
-    await sendViaSupabaseChunks(pin, session.file, stored.chunks, cbs);
-    activeSenderSessions.delete(pin);
-  } catch (error) {
-    if (!cancelledPins.has(pin)) {
-      cbs.onError((error as Error).message);
+    if (receivedChunks.length <= i) {
+      throw new Error('Download timed out — the file may not be fully uploaded yet.');
     }
   }
-}
 
-export function cancelSenderWatch(pin: string): void {
-  cancelledPins.add(pin);
-  activeSenderSessions.delete(pin);
-  inMemoryFiles.delete(pin);
-  leaveChat();
-  // Clean up Supabase data
-  if (supabase) {
-    void supabase.from('transfer_tickets').delete().eq('pin', pin);
-    void supabase.from('transfer_chunks').delete().eq('pin', pin);
-    void supabase.from('transfer_chat').delete().eq('pin', pin);
-  }
-}
+  // Mark as done
+  await supabase.from('file_offers').update({ status: 'done' }).eq('file_id', offer.file_id).eq('pin', currentPin!);
 
-// --- Public API: Receiver ---------------------------------------------------
-
-export async function initReceiverEngine(
-  pin: string,
-  cb?: TransferCallbacks,
-): Promise<ReceiverSession> {
-  const cbs = cb ?? defaultCallbacks;
-
-  const entry = await resolveTicket(pin);
-  if (!entry) {
-    throw new Error(
-      'No active transfer found for that PIN. Ask the sender to share their 6-digit code, then try again.',
-    );
-  }
-
-  // Same-device fast path
-  const stored = inMemoryFiles.get(pin);
-  if (stored) {
-    cbs.onStage('Actively Streaming Data');
-    let transferred = 0;
-    const startTime = Date.now();
-    for (const chunk of stored.chunks) {
-      await sleep(5);
-      transferred += chunk.byteLength;
-      const elapsed = (Date.now() - startTime) / 1000;
-      cbs.onProgress({
-        percent: Math.round((transferred / stored.meta.fileSize) * 100),
-        bytesTransferred: transferred,
-        totalBytes: stored.meta.fileSize,
-        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-        eta: calcEta(
-          stored.meta.fileSize - transferred,
-          transferred / Math.max(elapsed, 0.1),
-        ),
-      });
-    }
-    const url = URL.createObjectURL(
-      new Blob(stored.chunks, { type: stored.meta.fileType }),
-    );
-    inMemoryFiles.delete(pin);
-    cbs.onStage('Transfer Complete');
-    cbs.onComplete(url, entry.fileName, entry.fileSize);
-    await deleteTicket(pin);
-    return {
-      pairingPin: pin,
-      fileName: entry.fileName,
-      fileSize: entry.fileSize,
-      downloadUrl: url,
-    };
-  }
-
-  if (!supabase) {
-    throw new Error('Cannot receive cross-device without Supabase configuration');
-  }
-
-  // --- Connection-first handshake ---
-  cbs.onStage('Connecting...');
-
-  // Signal to sender that receiver is connected
-  await receiverSignalConnected(pin);
-
-  // Wait for sender to ack — the sender is auto-watching, so this should be fast
-  const ackDeadline = Date.now() + RECEIVER_ACK_TIMEOUT_MS;
-  let senderAcked = false;
-
-  while (Date.now() < ackDeadline) {
-    try {
-      const { data, error } = await supabase
-        .from('transfer_tickets')
-        .select('sender_status')
-        .eq('pin', pin)
-        .maybeSingle();
-
-      if (!error && (data?.sender_status === 'ack' || data?.sender_status === 'chunks_ready')) {
-        senderAcked = true;
-        break;
-      }
-    } catch {
-      /* keep polling */
-    }
-    await sleep(RECEIVER_ACK_POLL_MS);
-  }
-
-  if (!senderAcked) {
-    throw new Error('Sender did not respond within the timeout. Make sure the sender has selected a file and their pairing code is active.');
-  }
-
-  cbs.onStage('Connected');
-
-  // Start receiving chunks
-  const downloadUrl = await receiveViaSupabaseChunks(pin, entry.fileSize, entry.fileType, cbs);
-
-  cbs.onStage('Transfer Complete');
-  cbs.onComplete(downloadUrl, entry.fileName, entry.fileSize);
-  await deleteTicket(pin);
-
-  return {
-    pairingPin: pin,
-    fileName: entry.fileName,
-    fileSize: entry.fileSize,
-    downloadUrl,
-  };
-}
-
-export function isSupabaseConfigured(): boolean {
-  return supabase !== null;
+  return URL.createObjectURL(new Blob(receivedChunks, { type: offer.file_type }));
 }

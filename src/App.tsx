@@ -1,28 +1,48 @@
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from 'react';
+import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  Check,
+  ChevronRight,
+  Copy,
+  File as FileIcon,
+  FileArchive,
+  FileCode2,
+  FileImage,
+  FileText,
+  Link2,
+  LockKeyhole,
+  MoreHorizontal,
+  Plus,
+  Radio,
+  ScanLine,
+  Send,
+  Users,
+  X,
+  Zap,
+  UploadCloud,
+} from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
-  ArrowDownToLine, ArrowUpFromLine, Check, ChevronRight, Clock3,
-  File, FileArchive, FileCode2, FileImage, FileText, Gauge, History,
-  Link2, LockKeyhole, Menu, MessageSquare, MoveHorizontal as MoreHorizontal,
-  Radio, Send, ShieldCheck, CloudUpload as UploadCloud, Wifi, X, Zap,
-  ScanLine,
-} from 'lucide-react';
-import {
-  initReceiverEngine, initSenderEngine, startSenderWatch, cancelSenderWatch,
-  joinChat, sendChatMessage, loadChatHistory, leaveChat, isSupabaseConfigured,
-  type ChatMessage, type SenderSession, type TransferCallbacks,
-  type TransferProgress, type TransferStage,
+  createRoom,
+  downloadFile,
+  getCurrentMemberId,
+  getCurrentDisplayName,
+  isSupabaseConfigured,
+  joinRoom,
+  leaveRoom,
+  sendChatMessage,
+  shareFile,
+  type ChatMessage,
+  type FileOffer,
+  type RoomMember,
+  type RoomCallbacks,
+  type TransferProgress,
 } from '@/lib/transfer';
 import QrScanner from '@/components/QrScanner';
 
-type Panel = 'send' | 'receive';
+type Screen = 'landing' | 'room';
 type HistoryEntry = { name: string; size: string; status: 'Success' | 'Failed'; timestamp: string };
-
-const initialHistory: HistoryEntry[] = [
-  { name: 'design-system.fig', size: '24.8 MB', status: 'Success', timestamp: 'Today, 09:42' },
-  { name: 'product-demo.mp4', size: '148.2 MB', status: 'Success', timestamp: 'Yesterday, 18:06' },
-  { name: 'archive-assets.zip', size: '2.1 GB', status: 'Failed', timestamp: 'Aug 28, 14:31' },
-];
 
 const formatBytes = (bytes: number) => {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -37,141 +57,94 @@ const formatTimestamp = () => {
   return `Today, ${h}:${m}`;
 };
 
-const fileIcon = (type: string) => {
+const fileIconFor = (type: string) => {
   if (type.includes('image')) return FileImage;
   if (type.includes('zip') || type.includes('compressed') || type.includes('rar') || type.includes('7z')) return FileArchive;
   if (type.includes('text') || type.includes('pdf') || type.includes('document') || type.includes('msword') || type.includes('officedocument')) return FileText;
   if (type.includes('javascript') || type.includes('json') || type.includes('typescript') || type.includes('code')) return FileCode2;
-  return File;
+  return FileIcon;
 };
 
 function App() {
-  const [panel, setPanel] = useState<Panel>('send');
-  const [file, setFile] = useState<File | null>(null);
-  const [dragging, setDragging] = useState(false);
-  const [stage, setStage] = useState<TransferStage>('Idle');
-  const [secondsLeft, setSecondsLeft] = useState(600);
-  const [pin, setPin] = useState('843912');
-  const [pinDigits, setPinDigits] = useState(['', '', '', '', '', '']);
-  const [progress, setProgress] = useState<TransferProgress | null>(null);
+  const [screen, setScreen] = useState<Screen>('landing');
+  const [pin, setPin] = useState('');
   const [copied, setCopied] = useState(false);
-  const [errorMessage, setErrorMessage] = useState('');
-  const [downloadUrl, setDownloadUrl] = useState('');
-  const [downloadName, setDownloadName] = useState('');
-  const [senderSession, setSenderSession] = useState<SenderSession | null>(null);
-  const [supabaseReady] = useState(isSupabaseConfigured());
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [chatInput, setChatInput] = useState('');
-  const [chatJoined, setChatJoined] = useState(false);
+  const [pinDigits, setPinDigits] = useState(['', '', '', '', '', '']);
   const [showScanner, setShowScanner] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+
+  // Room state
+  const [members, setMembers] = useState<RoomMember[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [fileOffers, setFileOffers] = useState<FileOffer[]>([]);
+  const [progress, setProgress] = useState<Record<string, TransferProgress>>({});
+  const [chatInput, setChatInput] = useState('');
+  const [isHost, setIsHost] = useState(false);
+  const [dragging, setDragging] = useState(false);
+
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const callbacksRef = useRef<RoomCallbacks | null>(null);
+
   const [history, setHistory] = useState<HistoryEntry[]>(() => {
     const saved = localStorage.getItem('meshdrop-history');
-    return saved ? JSON.parse(saved) as HistoryEntry[] : initialHistory;
+    return saved ? JSON.parse(saved) as HistoryEntry[] : [];
   });
-
-  const callbacksRef = useRef<TransferCallbacks | undefined>(undefined);
-  const chatScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     localStorage.setItem('meshdrop-history', JSON.stringify(history));
   }, [history]);
 
   useEffect(() => {
-    if (stage !== 'Waiting for Peer...' || secondsLeft <= 0) return;
-    const timer = window.setInterval(() => setSecondsLeft((current) => Math.max(0, current - 1)), 1000);
-    return () => window.clearInterval(timer);
-  }, [stage, secondsLeft]);
-
-  useEffect(() => {
     if (chatScrollRef.current) {
       chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
     }
-  }, [chatMessages]);
+  }, [messages]);
 
-  const buildCallbacks = (): TransferCallbacks => ({
-    onStage: (nextStage) => setStage(nextStage),
-    onProgress: (p) => setProgress(p),
-    onComplete: (url, fileName, fileSize) => {
-      setDownloadUrl(url);
-      setDownloadName(fileName);
-      setHistory((prev) => [
-        { name: fileName, size: formatBytes(fileSize), status: 'Success', timestamp: formatTimestamp() },
-        ...prev,
-      ]);
-    },
-    onError: (message) => {
-      setErrorMessage(message);
-      setStage('Idle');
-      setHistory((prev) => [
-        { name: file?.name ?? 'Unknown', size: file ? formatBytes(file.size) : '—', status: 'Failed', timestamp: formatTimestamp() },
-        ...prev,
-      ]);
-    },
+  const buildCallbacks = (): RoomCallbacks => ({
+    onMembersChange: (m) => setMembers(m),
+    onChatMessage: (msg) => setMessages((prev) => {
+      if (prev.some((p) => p.id === msg.id)) return prev;
+      return [...prev, msg];
+    }),
+    onFileOffer: (offer) => setFileOffers((prev) => {
+      if (prev.some((p) => p.file_id === offer.file_id)) return prev;
+      return [...prev, offer];
+    }),
+    onFileOfferUpdate: (offer) => setFileOffers((prev) => prev.map((p) => p.file_id === offer.file_id ? offer : p)),
+    onProgress: (fileId, p) => setProgress((prev) => ({ ...prev, [fileId]: p })),
+    onError: (message) => setErrorMessage(message),
   });
 
   callbacksRef.current = buildCallbacks();
 
-  useEffect(() => {
-    const role = panel === 'send' ? 'sender' : 'receiver';
-    const shouldJoin = (panel === 'send' && !!file) || (panel === 'receive' && pinDigits.join('').length === 6);
-    if (shouldJoin && !chatJoined && supabaseReady) {
-      const chatPin = panel === 'send' ? pin : pinDigits.join('');
-      joinChat(chatPin, role, {
-        onMessage: (msg) => setChatMessages((prev) => [...prev, msg]),
-      });
-      void loadChatHistory(chatPin).then(setChatMessages);
-      setChatJoined(true);
-    }
-  }, [panel, file, pinDigits, chatJoined, supabaseReady, pin]);
+  useEffect(() => () => { leaveRoom(); }, []);
 
-  useEffect(() => () => leaveChat(), []);
-
-  const formattedTime = `${String(Math.floor(secondsLeft / 60)).padStart(2, '0')}:${String(secondsLeft % 60).padStart(2, '0')}`;
-  const activeFile = file ?? { name: 'project-export.zip', size: 182 * 1024 * 1024, type: 'application/zip' };
-  const FileIcon = fileIcon(activeFile.type);
-  const percentage = progress?.percent ?? 0;
-  const speed = progress?.speed ?? 0;
-  const eta = progress?.eta ?? 0;
-  const bytesTransferred = progress?.bytesTransferred ?? 0;
-  const activeChatPin = panel === 'send' ? pin : pinDigits.join('');
-
-  // The receive URL embedded in the QR code
-  const receiveUrl = `${window.location.origin}${window.location.pathname}#receive/${pin}`;
-
-  const processFile = async (nextFile: File) => {
-    setFile(nextFile);
-    setProgress(null);
+  const handleCreateRoom = async () => {
     setErrorMessage('');
-    setDownloadUrl('');
-    setSecondsLeft(600);
-    setStage('Hashing File');
-    setChatJoined(false);
-    setChatMessages([]);
     try {
-      const session = await initSenderEngine(nextFile, callbacksRef.current);
-      setPin(session.pairingPin);
-      setSenderSession(session);
-      // Auto-start watching for receiver — no button click needed
-      void startSenderWatch(session.pairingPin, callbacksRef.current);
+      const roomPin = await createRoom(callbacksRef.current!);
+      setPin(roomPin);
+      setIsHost(true);
+      setScreen('room');
     } catch (error) {
       setErrorMessage((error as Error).message);
-      setStage('Idle');
     }
   };
 
-  const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const nextFile = event.target.files?.[0];
-    if (nextFile) void processFile(nextFile);
+  const handleJoinRoom = async (joinPin: string) => {
+    setErrorMessage('');
+    try {
+      await joinRoom(joinPin, callbacksRef.current!);
+      setPin(joinPin);
+      setIsHost(false);
+      setScreen('room');
+    } catch (error) {
+      setErrorMessage((error as Error).message);
+    }
   };
 
-  const onDrop = (event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setDragging(false);
-    const nextFile = event.dataTransfer.files[0];
-    if (nextFile) void processFile(nextFile);
-  };
-
-  const handlePin = (value: string, index: number) => {
+  const handlePinDigit = (value: string, index: number) => {
     const digit = value.replace(/\D/g, '').slice(-1);
     const next = [...pinDigits];
     next[index] = digit;
@@ -179,253 +152,311 @@ function App() {
     if (digit && index < 5) document.getElementById(`pin-${index + 1}`)?.focus();
   };
 
-  const handleQrScan = (code: string) => {
-    setShowScanner(false);
-    const digits = code.replace(/\D/g, '').slice(0, 6).split('');
-    while (digits.length < 6) digits.push('');
-    setPinDigits(digits);
-    setPanel('receive');
-  };
-
-  const startReceiveTransfer = async () => {
-    setErrorMessage('');
-    setProgress({ percent: 0, bytesTransferred: 0, totalBytes: 0, speed: 0, eta: 0 });
-    try {
-      await initReceiverEngine(pinDigits.join(''), callbacksRef.current);
-    } catch (err) {
-      setErrorMessage((err as Error).message);
-      setStage('Idle');
-    }
-  };
-
-  const copyLink = async () => {
-    await navigator.clipboard?.writeText(receiveUrl);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1800);
-  };
-
   const handleSendChat = async () => {
     const msg = chatInput.trim();
     if (!msg) return;
     setChatInput('');
-    const role = panel === 'send' ? 'sender' : 'receiver';
     try {
-      await sendChatMessage(activeChatPin, role, msg);
-    } catch {
-      // Message will not appear but UI continues
+      await sendChatMessage(msg);
+    } catch { /* non-fatal */ }
+  };
+
+  const handleFileSelect = async (file: File) => {
+    try {
+      await shareFile(file);
+      setHistory((prev) => [
+        { name: file.name, size: formatBytes(file.size), status: 'Success', timestamp: formatTimestamp() },
+        ...prev,
+      ]);
+    } catch (error) {
+      setErrorMessage((error as Error).message);
+      setHistory((prev) => [
+        { name: file.name, size: formatBytes(file.size), status: 'Failed', timestamp: formatTimestamp() },
+        ...prev,
+      ]);
     }
   };
 
-  const clearSession = () => {
-    if (senderSession) cancelSenderWatch(senderSession.pairingPin);
-    setFile(null);
-    setStage('Idle');
-    setProgress(null);
-    setSecondsLeft(600);
-    setErrorMessage('');
-    setDownloadUrl('');
-    setSenderSession(null);
-    setChatMessages([]);
-    setChatJoined(false);
-    leaveChat();
+  const onFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) void handleFileSelect(file);
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const showChat = (panel === 'send' && !!file) || (panel === 'receive' && pinDigits.join('').length === 6);
+  const onDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragging(false);
+    const file = event.dataTransfer.files[0];
+    if (file) void handleFileSelect(file);
+  };
 
-  const isConnected = stage === 'Connected' || stage === 'Actively Streaming Data' || stage === 'Transfer Complete';
+  const handleDownload = async (offer: FileOffer) => {
+    try {
+      const url = await downloadFile(offer);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = offer.file_name;
+      a.click();
+      URL.revokeObjectURL(url);
+      setHistory((prev) => [
+        { name: offer.file_name, size: formatBytes(offer.file_size), status: 'Success', timestamp: formatTimestamp() },
+        ...prev,
+      ]);
+    } catch (error) {
+      setErrorMessage((error as Error).message);
+    }
+  };
+
+  const copyLink = async () => {
+    await navigator.clipboard?.writeText(`${window.location.origin}/#receive/${pin}`);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1800);
+  };
+
+  const handleLeaveRoom = () => {
+    leaveRoom();
+    setScreen('landing');
+    setPin('');
+    setMembers([]);
+    setMessages([]);
+    setFileOffers([]);
+    setProgress({});
+    setPinDigits(['', '', '', '', '', '']);
+    setIsHost(false);
+  };
+
+  const myId = getCurrentMemberId();
+  const myName = getCurrentDisplayName();
+  const supabaseReady = isSupabaseConfigured();
+
+  // --- Landing screen ---
+  if (screen === 'landing') {
+    return (
+      <main className="app-shell">
+        <header className="topbar">
+          <div className="brand-lockup"><div className="brand-mark"><Zap size={17} strokeWidth={2.7} /></div><span>mesh<span>drop</span></span><small>BETA</small></div>
+          <div className="topbar-right"><div className="network-pill"><span className="live-dot" /> {supabaseReady ? 'Network online' : 'Local mode'}</div><div className="divider" /><button className="icon-button" aria-label="More options"><MoreHorizontal size={20} /></button><button className="avatar" aria-label="Session">M</button></div>
+        </header>
+
+        <section className="hero-row">
+          <div>
+            <div className="eyebrow"><span className="eyebrow-line" /> SECURE. DIRECT. EPHEMERAL.</div>
+            <h1>Connect. Chat.<br /><em>Share anything.</em></h1>
+            <p className="hero-copy">Create a room, share the code, and start chatting and transferring files.<br />No accounts. No uploads. No trace.</p>
+          </div>
+          <div className="hero-status">
+            <div className="status-orbit"><div className="orbit-core"><Radio size={20} /></div><span className="orbit-dot dot-a" /><span className="orbit-dot dot-b" /><span className="orbit-dot dot-c" /></div>
+            <div><span className="status-label">SESSION STATUS</span><strong>Ephemeral & private</strong><span className="status-sub"><LockKeyhole size={12} /> End-to-end encrypted</span></div>
+          </div>
+        </section>
+
+        {errorMessage && <div className="error-banner"><X size={15} /> {errorMessage}</div>}
+
+        <section className="landing-actions">
+          <button className="landing-card create-card" onClick={handleCreateRoom}>
+            <div className="landing-card-icon"><ArrowUpFromLine size={28} /></div>
+            <h2>Create a room</h2>
+            <p>Generate a code and QR instantly. Share it with anyone you want to connect with.</p>
+            <span className="landing-card-cta">Get started <ChevronRight size={16} /></span>
+          </button>
+
+          <div className="landing-card join-card">
+            <div className="landing-card-icon"><ArrowDownToLine size={28} /></div>
+            <h2>Join a room</h2>
+            <p>Have a 6-digit code? Enter it below or scan a QR code to connect.</p>
+            <div className="pin-inputs">
+              {pinDigits.map((digit, index) => (
+                <input key={index} id={`pin-${index}`} inputMode="numeric" maxLength={1} value={digit}
+                  onChange={(e) => handlePinDigit(e.target.value, index)}
+                  aria-label={`Digit ${index + 1}`} />
+              ))}
+            </div>
+            <div className="join-actions">
+              <button className="primary-button" onClick={() => handleJoinRoom(pinDigits.join(''))} disabled={pinDigits.join('').length !== 6}>
+                Join room <ChevronRight size={16} />
+              </button>
+              <button className="secondary-button" onClick={() => setShowScanner(true)}>
+                <ScanLine size={16} /> Scan QR
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {history.length > 0 && (
+          <section className="history-section">
+            <div className="history-header"><div><span className="section-kicker">RECENT</span><h2>Transfer history</h2></div></div>
+            <div className="history-table">
+              <div className="history-row history-heading"><span>FILE</span><span>SIZE</span><span>STATUS</span><span>WHEN</span><span /></div>
+              {history.map((entry) => (
+                <div className="history-row" key={`${entry.name}-${entry.timestamp}`}>
+                  <span className="history-file"><span className="history-file-icon"><FileIcon size={15} /></span><strong>{entry.name}</strong></span>
+                  <span>{entry.size}</span>
+                  <span className={entry.status === 'Success' ? 'success-status' : 'failed-status'}><span /> {entry.status}</span>
+                  <span>{entry.timestamp}</span><button aria-label={`Open ${entry.name}`}><ChevronRight size={16} /></button>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <footer><span><Zap size={13} /> meshdrop</span><span>Built for direct connections <span className="footer-dot">·</span> No accounts required</span></footer>
+
+        {showScanner && <QrScanner onScan={(code) => { setShowScanner(false); void handleJoinRoom(code); }} onClose={() => setShowScanner(false)} />}
+      </main>
+    );
+  }
+
+  // --- Room screen ---
+  const onlineMembers = members.filter((m) => m.is_online);
+  const sortedOffers = [...fileOffers].sort((a, b) => a.created_at - b.created_at);
 
   return (
-    <main className="app-shell">
+    <main className="app-shell room-shell">
       <header className="topbar">
         <div className="brand-lockup"><div className="brand-mark"><Zap size={17} strokeWidth={2.7} /></div><span>mesh<span>drop</span></span><small>BETA</small></div>
-        <div className="topbar-right"><div className="network-pill"><span className="live-dot" /> {supabaseReady ? 'Network online' : 'Local mode'}</div><div className="divider" /><button className="icon-button" aria-label="More options"><MoreHorizontal size={20} /></button><button className="avatar" aria-label="Temporary session">M</button></div>
+        <div className="topbar-right">
+          <div className="room-pin-pill"><span className="live-dot" /> Room {pin.slice(0, 3)}—{pin.slice(3)}</div>
+          <div className="divider" />
+          <div className="members-pill"><Users size={14} /> {onlineMembers.length}</div>
+          <div className="divider" />
+          <button className="secondary-button compact" onClick={copyLink}>{copied ? <Check size={14} /> : <Link2 size={14} />} {copied ? 'Copied' : 'Copy link'}</button>
+          <div className="divider" />
+          <button className="leave-button" onClick={handleLeaveRoom}><X size={16} /> Leave</button>
+        </div>
       </header>
 
-      <section className="hero-row">
-        <div><div className="eyebrow"><span className="eyebrow-line" /> SECURE. DIRECT. EPHEMERAL.</div><h1>Move files at the<br /><em>speed of connection.</em></h1><p className="hero-copy">Peer-to-peer file transfers that stay between you and your recipient.<br />No accounts. No uploads. No trace.</p></div>
-        <div className="hero-status"><div className="status-orbit"><div className="orbit-core"><Radio size={20} /></div><span className="orbit-dot dot-a" /><span className="orbit-dot dot-b" /><span className="orbit-dot dot-c" /></div><div><span className="status-label">SESSION STATUS</span><strong>Ephemeral & private</strong><span className="status-sub"><LockKeyhole size={12} /> End-to-end encrypted</span></div></div>
-      </section>
-
-      <nav className="tabs" aria-label="Transfer mode">
-        <button className={panel === 'send' ? 'tab active' : 'tab'} onClick={() => setPanel('send')}><ArrowUpFromLine size={16} /> Send files</button>
-        <button className={panel === 'receive' ? 'tab active' : 'tab'} onClick={() => setPanel('receive')}><ArrowDownToLine size={16} /> Receive files</button>
-        <div className="tabs-spacer" /><span className="session-label">SESSION <b>#{pin.slice(0, 3)}—{pin.slice(3)}</b></span>
-      </nav>
-
-      <section className="workspace">
-        <div className="transfer-card">
-          <div className="card-topline"><div><span className="section-kicker">{panel === 'send' ? '01 / SEND' : '01 / RECEIVE'}</span><h2>{panel === 'send' ? 'Send a file' : 'Receive a file'}</h2></div><span className={`stage-badge ${isConnected ? 'streaming' : ''}`}><span className="stage-dot" /> {stage}</span></div>
-
-          {errorMessage && <div className="error-banner"><X size={15} /> {errorMessage}</div>}
-
-          {panel === 'send' ? <>
-            <div className={`drop-zone ${dragging ? 'dragging' : ''} ${file ? 'has-file' : ''}`} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={onDrop}>
-              {!file ? <><div className="upload-icon"><UploadCloud size={25} /></div><h3>Drop a file to begin</h3><p>or <label htmlFor="file-upload">browse from your device</label></p><span className="drop-hint">ANY FILE TYPE · DOCS, PDF, IMAGES, VIDEO · UP TO 5 GB</span><input id="file-upload" type="file" onChange={onFileChange} /></> : <div className="selected-file"><div className="file-symbol"><FileIcon size={24} /></div><div className="file-copy"><strong>{activeFile.name}</strong><span>{formatBytes(activeFile.size)} <i>·</i> {activeFile.type || 'Unknown type'}</span></div><button className="remove-file" onClick={clearSession} aria-label="Remove file"><X size={17} /></button></div>}
+      <div className="room-layout">
+        {/* Sidebar: room info + members */}
+        <aside className="room-sidebar">
+          <div className="sidebar-section">
+            <span className="section-kicker">ROOM CODE</span>
+            <div className="room-qr-wrapper">
+              <QRCodeSVG value={`${window.location.origin}/#receive/${pin}`} size={130} bgColor="#f6f8fa" fgColor="#101820" level="M" />
             </div>
-            {file && <div className="file-meta-row"><div><span>FILE NAME</span><strong>{activeFile.name}</strong></div><div><span>SIZE</span><strong>{formatBytes(activeFile.size)}</strong></div><div><span>TYPE</span><strong>{activeFile.type || 'Binary file'}</strong></div></div>}
-            {file && <div className="send-details">
-              <div className="pin-panel">
-                <div className="detail-heading"><span className="section-kicker">PAIRING CODE</span><span className="expires"><Clock3 size={13} /> Expires in <b>{formattedTime}</b></span></div>
-                <div className="pin-value">{pin.slice(0, 3)} <span>{pin.slice(3)}</span></div>
-                <p>Share this code with your recipient</p>
-                <button className="secondary-button" onClick={copyLink}>{copied ? <Check size={15} /> : <Link2 size={15} />} {copied ? 'Link copied' : 'Copy direct link'}</button>
-              </div>
-              <div className="qr-panel">
-                <div className="qr-code-wrapper">
-                  <QRCodeSVG value={receiveUrl} size={120} level="M" bgColor="#f6f8fa" fgColor="#101820" />
-                </div>
-                <span>Scan to connect</span>
-              </div>
-            </div>}
-
-            {file && stage === 'Waiting for Peer...' && (
-              <div className="waiting-peer-info">
-                <div className="waiting-pulse" />
-                <p>Waiting for receiver to enter the code and connect...</p>
-              </div>
-            )}
-
-            {file && stage === 'Connected' && (
-              <div className="connection-confirmed">
-                <Check size={16} /> Receiver connected! Starting transfer...
-              </div>
-            )}
-
-            {file && stage === 'Actively Streaming Data' && (
-              <div className="connection-confirmed">
-                <span className="live-dot" /> Uploading file to relay...
-              </div>
-            )}
-            {downloadUrl && stage === 'Transfer Complete' && <a className="primary-button wide" href={downloadUrl} download={downloadName}><ArrowDownToLine size={16} /> Download {downloadName}</a>}
-          </> : (
-            <div className="receive-view">
-              <div className="receive-intro">
-                <div className="receive-icon"><ArrowDownToLine size={23} /></div>
-                <h3>Enter your pairing code</h3>
-                <p>Ask the sender for their 6-digit code to establish a direct connection.</p>
-              </div>
-              <div className="pin-inputs">
-                {pinDigits.map((digit, index) => (
-                  <input key={index} id={`pin-${index}`} inputMode="numeric" maxLength={1} value={digit}
-                    onChange={(event) => handlePin(event.target.value, index)}
-                    aria-label={`Pairing digit ${index + 1}`} />
-                ))}
-              </div>
-              <button className="camera-button" onClick={() => setShowScanner(true)}>
-                <ScanLine size={17} /> Scan QR code with camera
-              </button>
-              <button className="primary-button wide" onClick={startReceiveTransfer}
-                disabled={pinDigits.join('').length !== 6 || stage === 'Actively Streaming Data' || stage === 'Connecting...' || stage === 'Connected'}>
-                <ArrowDownToLine size={16} /> {stage === 'Connecting...' ? 'Connecting...' : stage === 'Connected' ? 'Connected — waiting for file...' : stage === 'Actively Streaming Data' ? 'Receiving...' : 'Download file'} <ChevronRight size={16} />
-              </button>
-
-              {stage === 'Connected' && (
-                <div className="connection-confirmed">
-                  <Check size={16} /> Connected to sender! Waiting for file transfer to begin...
-                </div>
-              )}
-
-              {downloadUrl && stage === 'Transfer Complete' && <a className="primary-button wide" href={downloadUrl} download={downloadName}><ArrowDownToLine size={16} /> Save {downloadName}</a>}
-            </div>
-          )}
-        </div>
-
-        <aside className="metrics-card">
-          <div className="card-topline compact">
-            <div><span className="section-kicker">02 / TELEMETRY</span><h2>Transfer metrics</h2></div>
-            <Gauge size={19} className="muted-icon" />
+            <div className="room-pin-display">{pin.slice(0, 3)} <span>{pin.slice(3)}</span></div>
+            <p className="room-hint">Share this code or QR to invite others</p>
           </div>
-          {stage === 'Connecting...' || stage === 'Connected' || stage === 'Actively Streaming Data' || stage === 'Transfer Complete' ? (
-            <div className="metrics-live">
-              <div className="metric-progress">
-                <div className="metric-progress-head">
-                  <span><span className="live-dot" /> {stage === 'Connected' ? 'CONNECTED' : stage === 'Connecting...' ? 'CONNECTING...' : 'LIVE STREAM'}</span>
-                  <b>{percentage}%</b>
+
+          <div className="sidebar-section">
+            <span className="section-kicker">MEMBERS ({onlineMembers.length})</span>
+            <div className="members-list">
+              {onlineMembers.map((m) => (
+                <div key={m.member_id} className="member-item">
+                  <div className="member-avatar">{m.display_name.charAt(0)}</div>
+                  <div className="member-info">
+                    <strong>{m.display_name}{m.member_id === myId ? ' (You)' : ''}</strong>
+                    <span>{m.role === 'host' ? 'Host' : 'Member'}</span>
+                  </div>
+                  <span className="member-status online" />
                 </div>
-                <div className="progress-track"><div className="progress-fill" style={{ width: `${percentage}%` }} /></div>
-                <div className="progress-labels">
-                  <span>{formatBytes(bytesTransferred)} written</span>
-                  <span>{progress ? formatBytes(progress.totalBytes) : formatBytes(activeFile.size)}</span>
-                </div>
-              </div>
-              <div className="metric-grid">
-                <div><span>TRANSFER SPEED</span><strong>{speed} <small>MB/s</small></strong></div>
-                <div><span>TIME REMAINING</span><strong>{eta}<small> sec</small></strong></div>
-                <div><span>CONNECTION</span><strong className="connection"><Wifi size={14} /> {supabaseReady ? 'Direct P2P' : 'Local'}</strong></div>
-                <div><span>ENCRYPTION</span><strong className="connection"><ShieldCheck size={14} /> Secure</strong></div>
-              </div>
-              {stage === 'Connected' && <div className="connected-banner"><Check size={16} /> Connection established. File transfer will begin shortly.</div>}
-              {stage === 'Transfer Complete' && <div className="complete-banner"><Check size={16} /> Transfer complete. Your file is ready.</div>}
+              ))}
+              {onlineMembers.length === 0 && <p className="no-members">Waiting for others to join...</p>}
             </div>
-          ) : (
-            <div className="metrics-empty">
-              <div className="empty-graph"><span /><span /><span /><span /><span /><span /><span /></div>
-              <strong>Waiting for a transfer</strong>
-              <p>Live network telemetry will appear here once your peer connects.</p>
-              <div className="empty-detail"><span><Wifi size={14} /> Direct connection</span><span><ShieldCheck size={14} /> Encrypted channel</span></div>
+          </div>
+
+          <div className="sidebar-section">
+            <span className="section-kicker">SHARED FILES ({sortedOffers.length})</span>
+            <div className="sidebar-files">
+              {sortedOffers.map((offer) => {
+                const FileIconCmp = fileIconFor(offer.file_type);
+                return <div key={offer.file_id} className="sidebar-file-item"><FileIconCmp size={15} /><span>{offer.file_name}</span></div>;
+              })}
+              {sortedOffers.length === 0 && <p className="no-files">No files shared yet</p>}
             </div>
-          )}
-          <div className="privacy-note"><LockKeyhole size={14} /><span>Files never touch a server. This session disappears when you close this tab.</span></div>
+          </div>
         </aside>
-      </section>
 
-      {showChat && (
-        <section className="chat-section">
-          <div className="chat-header">
-            <div><span className="section-kicker">04 / CHAT</span><h2>In-session chat</h2></div>
-            <div className="chat-header-right"><MessageSquare size={15} /> <span>{chatMessages.length} messages</span></div>
-          </div>
-          <div className="chat-card">
+        {/* Main: chat + files */}
+        <section className="room-main">
+          <div className="chat-container">
             <div className="chat-messages" ref={chatScrollRef}>
-              {chatMessages.length === 0 && <div className="chat-empty"><MessageSquare size={22} /><p>No messages yet. Say hello to your peer.</p></div>}
-              {chatMessages.map((msg) => {
-                const isMine = (panel === 'send' && msg.sender === 'sender') || (panel === 'receive' && msg.sender === 'receiver');
+              {messages.length === 0 && <div className="chat-empty"><Radio size={28} /><p>No messages yet. Say hello to start the conversation.</p></div>}
+              {messages.map((msg) => {
+                if (msg.sender === 'system') {
+                  return <div key={msg.id} className="chat-system"><span>{msg.message}</span></div>;
+                }
+                const isMine = msg.sender_name === myName;
                 return (
                   <div key={msg.id} className={`chat-message ${isMine ? 'mine' : 'theirs'}`}>
-                    <span className="chat-sender">{msg.sender === 'sender' ? 'Sender' : 'Receiver'}</span>
+                    {!isMine && <span className="chat-sender">{msg.sender_name}</span>}
                     <span className="chat-bubble">{msg.message}</span>
                     <span className="chat-time">{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                   </div>
                 );
               })}
             </div>
-            <div className="chat-input-row">
-              <input type="text" className="chat-input" placeholder="Type a message..." value={chatInput}
+
+            {/* File offers inline */}
+            {sortedOffers.length > 0 && (
+              <div className="file-offers-strip">
+                {sortedOffers.map((offer) => {
+                  const FileIconCmp = fileIconFor(offer.file_type);
+                  const p = progress[offer.file_id];
+                  const isMine = offer.sender_id === myId;
+                  return (
+                    <div key={offer.file_id} className="file-offer-card">
+                      <div className="file-offer-icon"><FileIconCmp size={22} /></div>
+                      <div className="file-offer-info">
+                        <strong>{offer.file_name}</strong>
+                        <span>{formatBytes(offer.file_size)} · {isMine ? 'You' : offer.sender_name}</span>
+                        {p && (offer.status === 'uploading' || offer.status === 'downloading') && (
+                          <div className="file-offer-progress">
+                            <div className="progress-track"><div className="progress-fill" style={{ width: `${p.percent}%` }} /></div>
+                            <span>{p.percent}% · {p.speed} MB/s</span>
+                          </div>
+                        )}
+                        {offer.status === 'uploading' && <span className="file-status uploading">Uploading...</span>}
+                        {offer.status === 'ready' && !isMine && (
+                          <button className="file-download-btn" onClick={() => handleDownload(offer)}>
+                            <ArrowDownToLine size={14} /> Download
+                          </button>
+                        )}
+                        {offer.status === 'ready' && isMine && <span className="file-status ready">Ready to download</span>}
+                        {offer.status === 'downloading' && <span className="file-status downloading">Downloading...</span>}
+                        {offer.status === 'done' && <span className="file-status done"><Check size={12} /> Downloaded</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Drag overlay */}
+            {dragging && <div className="drag-overlay"><UploadCloud size={40} /><p>Drop file to share</p></div>}
+
+            {/* Chat input */}
+            <div className="chat-input-row"
+              onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={onDrop}
+            >
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={onFileChange}
+                style={{ display: 'none' }}
+              />
+              <button className="chat-attach-btn" onClick={() => fileInputRef.current?.click()} aria-label="Share file">
+                <Plus size={20} />
+              </button>
+              <input
+                type="text"
+                className="chat-input"
+                placeholder="Type a message or drop a file..."
+                value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void handleSendChat(); } }}
-                maxLength={1000} />
-              <button className="chat-send-button" onClick={handleSendChat} disabled={!chatInput.trim()} aria-label="Send message"><Send size={16} /></button>
+                maxLength={1000}
+              />
+              <button className="chat-send-button" onClick={handleSendChat} disabled={!chatInput.trim()} aria-label="Send">
+                <Send size={16} />
+              </button>
             </div>
           </div>
         </section>
-      )}
+      </div>
 
-      <section className="history-section">
-        <div className="history-header">
-          <div><span className="section-kicker">03 / LOCAL ONLY</span><h2>Transfer history</h2></div>
-          <div className="history-caption"><History size={15} /> Stored in this browser only <ChevronRight size={15} /></div>
-        </div>
-        <div className="history-table">
-          <div className="history-row history-heading"><span>FILE</span><span>SIZE</span><span>STATUS</span><span>WHEN</span><span /></div>
-          {history.map((entry) => (
-            <div className="history-row" key={`${entry.name}-${entry.timestamp}`}>
-              <span className="history-file"><span className="history-file-icon"><File size={15} /></span><strong>{entry.name}</strong></span>
-              <span>{entry.size}</span>
-              <span className={entry.status === 'Success' ? 'success-status' : 'failed-status'}><span /> {entry.status}</span>
-              <span>{entry.timestamp}</span>
-              <button aria-label={`Open ${entry.name}`}><ChevronRight size={16} /></button>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <footer>
-        <span><Zap size={13} /> meshdrop</span>
-        <span>Built for direct connections <span className="footer-dot">·</span> No accounts required</span>
-        <button aria-label="Open menu"><Menu size={17} /></button>
-      </footer>
-
-      {showScanner && <QrScanner onScan={handleQrScan} onClose={() => setShowScanner(false)} />}
+      {errorMessage && <div className="error-toast"><X size={15} /> {errorMessage} <button onClick={() => setErrorMessage('')}><X size={13} /></button></div>}
     </main>
   );
 }
