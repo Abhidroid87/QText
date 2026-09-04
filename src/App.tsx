@@ -1,20 +1,19 @@
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from 'react';
-import { ArrowDownToLine, ArrowUpFromLine, Camera, Check, ChevronRight, Clock3, Copy, File, FileArchive, FileCode2, FileImage, FileText, Gauge, History, Link2, LockKeyhole, Menu, MessageSquare, MoveHorizontal as MoreHorizontal, Radio, Send, ShieldCheck, CloudUpload as UploadCloud, Wifi, X, Zap } from 'lucide-react';
+import { QRCodeSVG } from 'qrcode.react';
 import {
-  initReceiverEngine,
-  initSenderEngine,
-  streamSenderFile,
-  joinChat,
-  sendChatMessage,
-  loadChatHistory,
-  leaveChat,
-  isSupabaseConfigured,
-  type ChatMessage,
-  type SenderSession,
-  type TransferCallbacks,
-  type TransferProgress,
-  type TransferStage,
+  ArrowDownToLine, ArrowUpFromLine, Check, ChevronRight, Clock3,
+  File, FileArchive, FileCode2, FileImage, FileText, Gauge, History,
+  Link2, LockKeyhole, Menu, MessageSquare, MoveHorizontal as MoreHorizontal,
+  Radio, Send, ShieldCheck, CloudUpload as UploadCloud, Wifi, X, Zap,
+  ScanLine,
+} from 'lucide-react';
+import {
+  initReceiverEngine, initSenderEngine, startSenderWatch, cancelSenderWatch,
+  joinChat, sendChatMessage, loadChatHistory, leaveChat, isSupabaseConfigured,
+  type ChatMessage, type SenderSession, type TransferCallbacks,
+  type TransferProgress, type TransferStage,
 } from '@/lib/transfer';
+import QrScanner from '@/components/QrScanner';
 
 type Panel = 'send' | 'receive';
 type HistoryEntry = { name: string; size: string; status: 'Success' | 'Failed'; timestamp: string };
@@ -46,29 +45,6 @@ const fileIcon = (type: string) => {
   return File;
 };
 
-function QrCode({ value }: { value: string }) {
-  const cells = Array.from({ length: 21 * 21 }, (_, index) => {
-    const x = index % 21;
-    const y = Math.floor(index / 21);
-    const hash = Array.from(value).reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    const reserved = (x < 7 && y < 7) || (x >= 14 && y < 7) || (x < 7 && y >= 14);
-    const finder = (ox: number, oy: number) => {
-      const dx = x - ox;
-      const dy = y - oy;
-      return dx >= 0 && dx < 7 && dy >= 0 && dy < 7 && (dx === 0 || dx === 6 || dy === 0 || dy === 6 || (dx >= 2 && dx <= 4 && dy >= 2 && dy <= 4));
-    };
-    const filled = finder(0, 0) || finder(14, 0) || finder(0, 14) || (!reserved && ((x * 13 + y * 7 + hash + x * y) % 5 < 2));
-    return { x, y, filled };
-  });
-
-  return (
-    <svg className="qr-code" viewBox="0 0 21 21" role="img" aria-label="Transfer QR code">
-      <rect width="21" height="21" fill="#f6f8fa" />
-      {cells.filter((cell) => cell.filled).map((cell) => <rect key={`${cell.x}-${cell.y}`} x={cell.x} y={cell.y} width="1" height="1" fill="#101820" />)}
-    </svg>
-  );
-}
-
 function App() {
   const [panel, setPanel] = useState<Panel>('send');
   const [file, setFile] = useState<File | null>(null);
@@ -87,6 +63,7 @@ function App() {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatJoined, setChatJoined] = useState(false);
+  const [showScanner, setShowScanner] = useState(false);
   const [history, setHistory] = useState<HistoryEntry[]>(() => {
     const saved = localStorage.getItem('meshdrop-history');
     return saved ? JSON.parse(saved) as HistoryEntry[] : initialHistory;
@@ -134,7 +111,6 @@ function App() {
 
   callbacksRef.current = buildCallbacks();
 
-  // Join chat when we have a PIN and are in an active transfer
   useEffect(() => {
     const role = panel === 'send' ? 'sender' : 'receiver';
     const shouldJoin = (panel === 'send' && !!file) || (panel === 'receive' && pinDigits.join('').length === 6);
@@ -159,6 +135,9 @@ function App() {
   const bytesTransferred = progress?.bytesTransferred ?? 0;
   const activeChatPin = panel === 'send' ? pin : pinDigits.join('');
 
+  // The receive URL embedded in the QR code
+  const receiveUrl = `${window.location.origin}${window.location.pathname}#receive/${pin}`;
+
   const processFile = async (nextFile: File) => {
     setFile(nextFile);
     setProgress(null);
@@ -172,6 +151,8 @@ function App() {
       const session = await initSenderEngine(nextFile, callbacksRef.current);
       setPin(session.pairingPin);
       setSenderSession(session);
+      // Auto-start watching for receiver — no button click needed
+      void startSenderWatch(session.pairingPin, callbacksRef.current);
     } catch (error) {
       setErrorMessage((error as Error).message);
       setStage('Idle');
@@ -198,10 +179,12 @@ function App() {
     if (digit && index < 5) document.getElementById(`pin-${index + 1}`)?.focus();
   };
 
-  const startSendTransfer = async () => {
-    if (!file || !senderSession) return;
-    setProgress({ percent: 0, bytesTransferred: 0, totalBytes: file.size, speed: 0, eta: 0 });
-    await streamSenderFile(senderSession.pairingPin, callbacksRef.current);
+  const handleQrScan = (code: string) => {
+    setShowScanner(false);
+    const digits = code.replace(/\D/g, '').slice(0, 6).split('');
+    while (digits.length < 6) digits.push('');
+    setPinDigits(digits);
+    setPanel('receive');
   };
 
   const startReceiveTransfer = async () => {
@@ -216,7 +199,7 @@ function App() {
   };
 
   const copyLink = async () => {
-    await navigator.clipboard?.writeText(`meshdrop.local/receive/${pin}`);
+    await navigator.clipboard?.writeText(receiveUrl);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1800);
   };
@@ -234,6 +217,7 @@ function App() {
   };
 
   const clearSession = () => {
+    if (senderSession) cancelSenderWatch(senderSession.pairingPin);
     setFile(null);
     setStage('Idle');
     setProgress(null);
@@ -247,6 +231,8 @@ function App() {
   };
 
   const showChat = (panel === 'send' && !!file) || (panel === 'receive' && pinDigits.join('').length === 6);
+
+  const isConnected = stage === 'Connected' || stage === 'Actively Streaming Data' || stage === 'Transfer Complete';
 
   return (
     <main className="app-shell">
@@ -268,7 +254,7 @@ function App() {
 
       <section className="workspace">
         <div className="transfer-card">
-          <div className="card-topline"><div><span className="section-kicker">{panel === 'send' ? '01 / SEND' : '01 / RECEIVE'}</span><h2>{panel === 'send' ? 'Send a file' : 'Receive a file'}</h2></div><span className={`stage-badge ${stage === 'Actively Streaming Data' || stage === 'Connecting...' ? 'streaming' : ''}`}><span className="stage-dot" /> {stage}</span></div>
+          <div className="card-topline"><div><span className="section-kicker">{panel === 'send' ? '01 / SEND' : '01 / RECEIVE'}</span><h2>{panel === 'send' ? 'Send a file' : 'Receive a file'}</h2></div><span className={`stage-badge ${isConnected ? 'streaming' : ''}`}><span className="stage-dot" /> {stage}</span></div>
 
           {errorMessage && <div className="error-banner"><X size={15} /> {errorMessage}</div>}
 
@@ -277,13 +263,110 @@ function App() {
               {!file ? <><div className="upload-icon"><UploadCloud size={25} /></div><h3>Drop a file to begin</h3><p>or <label htmlFor="file-upload">browse from your device</label></p><span className="drop-hint">ANY FILE TYPE · DOCS, PDF, IMAGES, VIDEO · UP TO 5 GB</span><input id="file-upload" type="file" onChange={onFileChange} /></> : <div className="selected-file"><div className="file-symbol"><FileIcon size={24} /></div><div className="file-copy"><strong>{activeFile.name}</strong><span>{formatBytes(activeFile.size)} <i>·</i> {activeFile.type || 'Unknown type'}</span></div><button className="remove-file" onClick={clearSession} aria-label="Remove file"><X size={17} /></button></div>}
             </div>
             {file && <div className="file-meta-row"><div><span>FILE NAME</span><strong>{activeFile.name}</strong></div><div><span>SIZE</span><strong>{formatBytes(activeFile.size)}</strong></div><div><span>TYPE</span><strong>{activeFile.type || 'Binary file'}</strong></div></div>}
-            {file && <div className="send-details"><div className="pin-panel"><div className="detail-heading"><span className="section-kicker">PAIRING CODE</span><span className="expires"><Clock3 size={13} /> Expires in <b>{formattedTime}</b></span></div><div className="pin-value">{pin.slice(0, 3)} <span>{pin.slice(3)}</span></div><p>Share this code with your recipient</p><button className="secondary-button" onClick={copyLink}>{copied ? <Check size={15} /> : <Link2 size={15} />} {copied ? 'Link copied' : 'Copy direct link'}</button></div><div className="qr-panel"><QrCode value={pin} /><span>Scan to connect</span></div></div>}
-            {file && (stage === 'Waiting for Peer...' || stage === 'Connecting...') && <button className="primary-button wide" onClick={startSendTransfer} disabled={stage === 'Connecting...'}>{stage === 'Connecting...' ? <><span className="live-dot" /> Connecting to peer...</> : <><Send size={16} /> Start secure transfer <ChevronRight size={16} /></>}</button>}
+            {file && <div className="send-details">
+              <div className="pin-panel">
+                <div className="detail-heading"><span className="section-kicker">PAIRING CODE</span><span className="expires"><Clock3 size={13} /> Expires in <b>{formattedTime}</b></span></div>
+                <div className="pin-value">{pin.slice(0, 3)} <span>{pin.slice(3)}</span></div>
+                <p>Share this code with your recipient</p>
+                <button className="secondary-button" onClick={copyLink}>{copied ? <Check size={15} /> : <Link2 size={15} />} {copied ? 'Link copied' : 'Copy direct link'}</button>
+              </div>
+              <div className="qr-panel">
+                <div className="qr-code-wrapper">
+                  <QRCodeSVG value={receiveUrl} size={120} level="M" bgColor="#f6f8fa" fgColor="#101820" />
+                </div>
+                <span>Scan to connect</span>
+              </div>
+            </div>}
+
+            {file && stage === 'Waiting for Peer...' && (
+              <div className="waiting-peer-info">
+                <div className="waiting-pulse" />
+                <p>Waiting for receiver to enter the code and connect...</p>
+              </div>
+            )}
+
+            {file && stage === 'Connected' && (
+              <div className="connection-confirmed">
+                <Check size={16} /> Receiver connected! Starting transfer...
+              </div>
+            )}
+
+            {file && stage === 'Actively Streaming Data' && (
+              <div className="connection-confirmed">
+                <span className="live-dot" /> Uploading file to relay...
+              </div>
+            )}
             {downloadUrl && stage === 'Transfer Complete' && <a className="primary-button wide" href={downloadUrl} download={downloadName}><ArrowDownToLine size={16} /> Download {downloadName}</a>}
-          </> : <div className="receive-view"><div className="receive-intro"><div className="receive-icon"><ArrowDownToLine size={23} /></div><h3>Enter your pairing code</h3><p>Ask the sender for their 6-digit code to establish a direct connection.</p></div><div className="pin-inputs">{pinDigits.map((digit, index) => <input key={index} id={`pin-${index}`} inputMode="numeric" maxLength={1} value={digit} onChange={(event) => handlePin(event.target.value, index)} aria-label={`Pairing digit ${index + 1}`} />)}</div><button className="camera-button"><Camera size={17} /> Scan QR code with camera</button><button className="primary-button wide" onClick={startReceiveTransfer} disabled={pinDigits.join('').length !== 6 || stage === 'Actively Streaming Data' || stage === 'Connecting...'}><ArrowDownToLine size={16} /> {stage === 'Connecting...' ? 'Connecting...' : stage === 'Actively Streaming Data' ? 'Receiving...' : 'Download file'} <ChevronRight size={16} /></button>{downloadUrl && stage === 'Transfer Complete' && <a className="primary-button wide" href={downloadUrl} download={downloadName}><ArrowDownToLine size={16} /> Save {downloadName}</a>}</div>}
+          </> : (
+            <div className="receive-view">
+              <div className="receive-intro">
+                <div className="receive-icon"><ArrowDownToLine size={23} /></div>
+                <h3>Enter your pairing code</h3>
+                <p>Ask the sender for their 6-digit code to establish a direct connection.</p>
+              </div>
+              <div className="pin-inputs">
+                {pinDigits.map((digit, index) => (
+                  <input key={index} id={`pin-${index}`} inputMode="numeric" maxLength={1} value={digit}
+                    onChange={(event) => handlePin(event.target.value, index)}
+                    aria-label={`Pairing digit ${index + 1}`} />
+                ))}
+              </div>
+              <button className="camera-button" onClick={() => setShowScanner(true)}>
+                <ScanLine size={17} /> Scan QR code with camera
+              </button>
+              <button className="primary-button wide" onClick={startReceiveTransfer}
+                disabled={pinDigits.join('').length !== 6 || stage === 'Actively Streaming Data' || stage === 'Connecting...' || stage === 'Connected'}>
+                <ArrowDownToLine size={16} /> {stage === 'Connecting...' ? 'Connecting...' : stage === 'Connected' ? 'Connected — waiting for file...' : stage === 'Actively Streaming Data' ? 'Receiving...' : 'Download file'} <ChevronRight size={16} />
+              </button>
+
+              {stage === 'Connected' && (
+                <div className="connection-confirmed">
+                  <Check size={16} /> Connected to sender! Waiting for file transfer to begin...
+                </div>
+              )}
+
+              {downloadUrl && stage === 'Transfer Complete' && <a className="primary-button wide" href={downloadUrl} download={downloadName}><ArrowDownToLine size={16} /> Save {downloadName}</a>}
+            </div>
+          )}
         </div>
 
-        <aside className="metrics-card"><div className="card-topline compact"><div><span className="section-kicker">02 / TELEMETRY</span><h2>Transfer metrics</h2></div><Gauge size={19} className="muted-icon" /></div>{stage === 'Connecting...' || stage === 'Actively Streaming Data' || stage === 'Transfer Complete' ? <div className="metrics-live"><div className="metric-progress"><div className="metric-progress-head"><span><span className="live-dot" /> LIVE STREAM</span><b>{percentage}%</b></div><div className="progress-track"><div className="progress-fill" style={{ width: `${percentage}%` }} /></div><div className="progress-labels"><span>{formatBytes(bytesTransferred)} written</span><span>{progress ? formatBytes(progress.totalBytes) : formatBytes(activeFile.size)}</span></div></div><div className="metric-grid"><div><span>TRANSFER SPEED</span><strong>{speed} <small>MB/s</small></strong></div><div><span>TIME REMAINING</span><strong>{eta}<small> sec</small></strong></div><div><span>CONNECTION</span><strong className="connection"><Wifi size={14} /> {supabaseReady ? 'Direct P2P' : 'Local'}</strong></div><div><span>ENCRYPTION</span><strong className="connection"><ShieldCheck size={14} /> Secure</strong></div></div>{stage === 'Transfer Complete' && <div className="complete-banner"><Check size={16} /> Transfer complete. Your file is ready.</div>}</div> : <div className="metrics-empty"><div className="empty-graph"><span /><span /><span /><span /><span /><span /><span /></div><strong>Waiting for a transfer</strong><p>Live network telemetry will appear here once your peer connects.</p><div className="empty-detail"><span><Wifi size={14} /> Direct connection</span><span><ShieldCheck size={14} /> Encrypted channel</span></div></div>}<div className="privacy-note"><LockKeyhole size={14} /><span>Files never touch a server. This session disappears when you close this tab.</span></div></aside>
+        <aside className="metrics-card">
+          <div className="card-topline compact">
+            <div><span className="section-kicker">02 / TELEMETRY</span><h2>Transfer metrics</h2></div>
+            <Gauge size={19} className="muted-icon" />
+          </div>
+          {stage === 'Connecting...' || stage === 'Connected' || stage === 'Actively Streaming Data' || stage === 'Transfer Complete' ? (
+            <div className="metrics-live">
+              <div className="metric-progress">
+                <div className="metric-progress-head">
+                  <span><span className="live-dot" /> {stage === 'Connected' ? 'CONNECTED' : stage === 'Connecting...' ? 'CONNECTING...' : 'LIVE STREAM'}</span>
+                  <b>{percentage}%</b>
+                </div>
+                <div className="progress-track"><div className="progress-fill" style={{ width: `${percentage}%` }} /></div>
+                <div className="progress-labels">
+                  <span>{formatBytes(bytesTransferred)} written</span>
+                  <span>{progress ? formatBytes(progress.totalBytes) : formatBytes(activeFile.size)}</span>
+                </div>
+              </div>
+              <div className="metric-grid">
+                <div><span>TRANSFER SPEED</span><strong>{speed} <small>MB/s</small></strong></div>
+                <div><span>TIME REMAINING</span><strong>{eta}<small> sec</small></strong></div>
+                <div><span>CONNECTION</span><strong className="connection"><Wifi size={14} /> {supabaseReady ? 'Direct P2P' : 'Local'}</strong></div>
+                <div><span>ENCRYPTION</span><strong className="connection"><ShieldCheck size={14} /> Secure</strong></div>
+              </div>
+              {stage === 'Connected' && <div className="connected-banner"><Check size={16} /> Connection established. File transfer will begin shortly.</div>}
+              {stage === 'Transfer Complete' && <div className="complete-banner"><Check size={16} /> Transfer complete. Your file is ready.</div>}
+            </div>
+          ) : (
+            <div className="metrics-empty">
+              <div className="empty-graph"><span /><span /><span /><span /><span /><span /><span /></div>
+              <strong>Waiting for a transfer</strong>
+              <p>Live network telemetry will appear here once your peer connects.</p>
+              <div className="empty-detail"><span><Wifi size={14} /> Direct connection</span><span><ShieldCheck size={14} /> Encrypted channel</span></div>
+            </div>
+          )}
+          <div className="privacy-note"><LockKeyhole size={14} /><span>Files never touch a server. This session disappears when you close this tab.</span></div>
+        </aside>
       </section>
 
       {showChat && (
@@ -307,23 +390,42 @@ function App() {
               })}
             </div>
             <div className="chat-input-row">
-              <input
-                type="text"
-                className="chat-input"
-                placeholder="Type a message..."
-                value={chatInput}
+              <input type="text" className="chat-input" placeholder="Type a message..." value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void handleSendChat(); } }}
-                maxLength={1000}
-              />
+                maxLength={1000} />
               <button className="chat-send-button" onClick={handleSendChat} disabled={!chatInput.trim()} aria-label="Send message"><Send size={16} /></button>
             </div>
           </div>
         </section>
       )}
 
-      <section className="history-section"><div className="history-header"><div><span className="section-kicker">03 / LOCAL ONLY</span><h2>Transfer history</h2></div><div className="history-caption"><History size={15} /> Stored in this browser only <ChevronRight size={15} /></div></div><div className="history-table"><div className="history-row history-heading"><span>FILE</span><span>SIZE</span><span>STATUS</span><span>WHEN</span><span /></div>{history.map((entry) => <div className="history-row" key={`${entry.name}-${entry.timestamp}`}><span className="history-file"><span className="history-file-icon"><File size={15} /></span><strong>{entry.name}</strong></span><span>{entry.size}</span><span className={entry.status === 'Success' ? 'success-status' : 'failed-status'}><span /> {entry.status}</span><span>{entry.timestamp}</span><button aria-label={`Open ${entry.name}`}><ChevronRight size={16} /></button></div>)}</div></section>
-      <footer><span><Zap size={13} /> meshdrop</span><span>Built for direct connections <span className="footer-dot">·</span> No accounts required</span><button aria-label="Open menu"><Menu size={17} /></button></footer>
+      <section className="history-section">
+        <div className="history-header">
+          <div><span className="section-kicker">03 / LOCAL ONLY</span><h2>Transfer history</h2></div>
+          <div className="history-caption"><History size={15} /> Stored in this browser only <ChevronRight size={15} /></div>
+        </div>
+        <div className="history-table">
+          <div className="history-row history-heading"><span>FILE</span><span>SIZE</span><span>STATUS</span><span>WHEN</span><span /></div>
+          {history.map((entry) => (
+            <div className="history-row" key={`${entry.name}-${entry.timestamp}`}>
+              <span className="history-file"><span className="history-file-icon"><File size={15} /></span><strong>{entry.name}</strong></span>
+              <span>{entry.size}</span>
+              <span className={entry.status === 'Success' ? 'success-status' : 'failed-status'}><span /> {entry.status}</span>
+              <span>{entry.timestamp}</span>
+              <button aria-label={`Open ${entry.name}`}><ChevronRight size={16} /></button>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <footer>
+        <span><Zap size={13} /> meshdrop</span>
+        <span>Built for direct connections <span className="footer-dot">·</span> No accounts required</span>
+        <button aria-label="Open menu"><Menu size={17} /></button>
+      </footer>
+
+      {showScanner && <QrScanner onScan={handleQrScan} onClose={() => setShowScanner(false)} />}
     </main>
   );
 }
