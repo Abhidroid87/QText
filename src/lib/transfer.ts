@@ -72,15 +72,18 @@ const PRESENCE_INTERVAL_MS = 5000;
 const PRESENCE_TIMEOUT_MS = 15000;
 
 // --- Supabase client --------------------------------------------------------
+//
+// The anon key is public-safe — it's designed to be exposed in the browser.
+// RLS policies protect the data, not the key. We hardcode fallback values so
+// the app works even when .env is missing (e.g. GitHub Pages builds where
+// .env is gitignored). Environment variables take priority when available.
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://vzagkaawgkagkbyllufq.supabase.co';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZ6YWdrYWF3Z2thZ2tieWxsdWZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg0MTc0NjksImV4cCI6MjEwMzk5MzQ2OX0.N1cdhY47TdkZpZ4T86Twl-LRiPQQesmswXFArpF47h8';
 
-const supabase = supabaseUrl && supabaseAnonKey && /^https?:\/\//i.test(supabaseUrl)
-  ? createClient(supabaseUrl, supabaseAnonKey, {
-      realtime: { params: { eventsPerSecond: 20 } },
-    })
-  : null;
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  realtime: { params: { eventsPerSecond: 20 } },
+});
 
 // --- Utilities --------------------------------------------------------------
 
@@ -151,7 +154,7 @@ let callbacksRef: RoomCallbacks | null = null;
 // --- Public API: Room management --------------------------------------------
 
 export function isSupabaseConfigured(): boolean {
-  return supabase !== null;
+  return true;
 }
 
 export function getCurrentMemberId(): string | null {
