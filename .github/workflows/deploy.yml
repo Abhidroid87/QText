@@ -29,29 +29,8 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
-      - name: Check Supabase configuration
-        env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-        run: |
-          node <<'NODE'
-          const fs = require('fs');
-          const clean = (value) => value.trim().replace(/^(?:"|')|(?:"|')$/g, '');
-          const url = clean(process.env.VITE_SUPABASE_URL || '');
-          const key = clean(process.env.VITE_SUPABASE_ANON_KEY || '');
-          if (!url || !key) throw new Error('Both Supabase secrets are required');
-          try {
-            const parsed = new URL(url);
-            if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
-          } catch {
-            throw new Error('VITE_SUPABASE_URL must be a valid HTTP(S) URL');
-          }
-          fs.appendFileSync(process.env.GITHUB_ENV, `VITE_SUPABASE_URL=${url}\nVITE_SUPABASE_ANON_KEY=${key}\n`);
-          NODE
+
       - name: Build
-        env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
         run: npm run build
 
       - name: Add SPA redirect
