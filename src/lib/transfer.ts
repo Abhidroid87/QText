@@ -66,7 +66,7 @@ export type RoomCallbacks = {
 
 const TICKET_TTL_MS = 10 * 60 * 1000;
 const STORAGE_PREFIX = 'meshdrop-pin-';
-const CHUNK_SIZE = 256 * 1024;
+const CHUNK_SIZE = 128 * 1024; // 128 KB — keeps base64 payload under ~175 KB to avoid Supabase row size limits
 const MAX_MESSAGE_LENGTH = 1000;
 const PRESENCE_INTERVAL_MS = 5000;
 const PRESENCE_TIMEOUT_MS = 15000;
@@ -531,12 +531,12 @@ async function uploadFileChunks(pin: string, fileId: string, chunks: ArrayBuffer
       const maxRetries = 5;
 
       while (retries < maxRetries) {
-        const { error } = await supabase.from('transfer_chunks').insert({
+        const { error } = await supabase.from('transfer_chunks').upsert({
           pin,
           chunk_index: i,
           data: b64,
           file_id: fileId,
-        });
+        }, { onConflict: 'pin,file_id,chunk_index' });
         if (!error) break;
         retries++;
         if (retries >= maxRetries) throw new Error(`Failed to upload chunk ${i}: ${error.message}`);
@@ -586,6 +586,8 @@ export async function downloadFile(offer: FileOffer): Promise<string> {
         .eq('pin', currentPin!)
         .eq('file_id', offer.file_id)
         .eq('chunk_index', i)
+        .order('id', { ascending: false })
+        .limit(1)
         .maybeSingle();
 
       if (error) throw error;
@@ -617,6 +619,9 @@ export async function downloadFile(offer: FileOffer): Promise<string> {
 
   // Mark as done
   await supabase.from('file_offers').update({ status: 'done' }).eq('file_id', offer.file_id).eq('pin', currentPin!);
+
+  // Clean up chunks to free database space
+  void supabase.from('transfer_chunks').delete().eq('pin', currentPin!).eq('file_id', offer.file_id);
 
   return URL.createObjectURL(new Blob(receivedChunks, { type: offer.file_type }));
 }
