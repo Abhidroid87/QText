@@ -326,20 +326,8 @@ function startRoomListeners(pin: string, cb: RoomCallbacks): void {
   if (chatChannel) void supabase.removeChannel(chatChannel);
   chatChannel = supabase
     .channel(`chat:${pin}`)
-    .on('postgres_changes', {
-      event: 'INSERT',
-      schema: 'public',
-      table: 'transfer_chat',
-      filter: `pin=eq.${pin}`,
-    }, (payload) => {
-      const row = payload.new as { id: string; sender: string; sender_name: string; message: string; created_at: string };
-      cb.onChatMessage({
-        id: String(row.id),
-        sender: row.sender as ChatMessage['sender'],
-        sender_name: row.sender_name || 'Anonymous',
-        message: row.message,
-        timestamp: new Date(row.created_at).getTime(),
-      });
+    .on('broadcast', { event: 'message' }, (event: { payload: ChatMessage }) => {
+      cb.onChatMessage(event.payload);
     })
     .subscribe();
 
@@ -412,18 +400,37 @@ function startRoomListeners(pin: string, cb: RoomCallbacks): void {
 
 // --- Chat -------------------------------------------------------------------
 
-export async function sendChatMessage(message: string): Promise<void> {
-  if (!supabase || !currentPin || !currentMemberId || !currentDisplayName) return;
+export async function sendChatMessage(message: string): Promise<ChatMessage | null> {
+  if (!supabase || !currentPin || !currentMemberId || !currentDisplayName) return null;
   const trimmed = message.trim().slice(0, MAX_MESSAGE_LENGTH);
-  if (!trimmed) return;
+  if (!trimmed) return null;
 
-  const { error } = await supabase.from('transfer_chat').insert({
-    pin: currentPin,
+  const chatMessage: ChatMessage = {
+    id: generateId(),
     sender: currentRole === 'host' ? 'sender' : 'receiver',
     sender_name: currentDisplayName,
     message: trimmed,
+    timestamp: Date.now(),
+  };
+
+  const { error } = await supabase.from('transfer_chat').insert({
+    pin: currentPin,
+    sender: chatMessage.sender,
+    sender_name: chatMessage.sender_name,
+    message: chatMessage.message,
   });
   if (error) throw new Error(`Failed to send message: ${error.message}`);
+
+  if (chatChannel) {
+    const result = await chatChannel.send({
+      type: 'broadcast',
+      event: 'message',
+      payload: chatMessage,
+    });
+    if (result !== 'ok') throw new Error('Message could not reach the room. Check the connection and try again.');
+  }
+
+  return chatMessage;
 }
 
 async function sendSystemMessage(pin: string, message: string): Promise<void> {

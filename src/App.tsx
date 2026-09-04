@@ -157,8 +157,16 @@ function App() {
     if (!msg) return;
     setChatInput('');
     try {
-      await sendChatMessage(msg);
-    } catch { /* non-fatal */ }
+      const sent = await sendChatMessage(msg);
+      if (sent) {
+        setMessages((prev) => {
+          if (prev.some((p) => p.id === sent.id)) return prev;
+          return [...prev, sent];
+        });
+      }
+    } catch (error) {
+      setErrorMessage((error as Error).message);
+    }
   };
 
   const handleFileSelect = async (file: File) => {
