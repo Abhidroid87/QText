@@ -1,22 +1,18 @@
 /**
  * Peer-to-peer transfer engine for Meshdrop.
  *
- * Transport strategy (in priority order):
+ * Transport strategy:
  *   1. Same-device fast path (in-memory, when sender+receiver share a browser)
- *   2. WebRTC data channel (when both peers are online and signaling succeeds)
- *   3. Supabase chunk relay (fallback — works on any static host including
- *      GitHub Pages, since it only needs the Supabase REST API)
+ *   2. Supabase chunk relay (primary cross-device transport — works on any
+ *      static host including GitHub Pages, only needs the Supabase REST API)
  *
- * Supabase is used for:
- *   - `transfer_tickets`: PIN → file metadata + connection state
- *   - `transfer_chunks`: chunked file relay fallback
- *   - `transfer_chat`: ephemeral text messages
- *   - Supabase Realtime: connection handshake + WebRTC SDP/ICE exchange
- *
- * Connection-first flow:
- *   The receiver resolves the PIN, then both sides exchange a "ping/pong"
- *   through the ticket row's `receiver_status` / `sender_status` columns.
- *   Only after the connection is confirmed does the file transfer begin.
+ * Connection-first flow (auto-start, no button click needed on sender side):
+ *   1. Sender selects file → publishes ticket → immediately starts watching
+ *   2. Receiver enters PIN → resolves ticket → signals "connected"
+ *   3. Sender detects receiver → acks → starts uploading chunks
+ *   4. Receiver detects ack → starts polling for chunks
+ *   5. Sender finishes upload → signals "chunks_ready"
+ *   6. Receiver collects all chunks → assembles file → download ready
  */
 
 import { createClient, type RealtimeChannel } from '@supabase/supabase-js';
@@ -78,18 +74,15 @@ type TicketEntry = TransferMeta & { ticket: string };
 const TICKET_TTL_MS = 10 * 60 * 1000;
 const STORAGE_PREFIX = 'meshdrop-pin-';
 const CHUNK_SIZE = 256 * 1024; // 256KB per chunk for Supabase relay
-const WEBRTC_CHUNK_SIZE = 16 * 1024; // 16KB per WebRTC message
-const RESOLVE_TIMEOUT_MS = 60000; // 60 seconds to find a PIN
+const RESOLVE_TIMEOUT_MS = 120_000; // 2 minutes to find a PIN
 const RESOLVE_POLL_MS = 1000;
-const HANDSHAKE_TIMEOUT_MS = 45000; // 45 seconds for connection handshake
-const HANDSHAKE_POLL_MS = 500;
+const SENDER_WATCH_TIMEOUT_MS = 10 * 60 * 1000; // Sender waits up to ticket TTL
+const SENDER_WATCH_POLL_MS = 1000;
+const RECEIVER_ACK_TIMEOUT_MS = 60_000; // Receiver waits 60s for sender ack
+const RECEIVER_ACK_POLL_MS = 500;
+const CHUNK_POLL_MS = 300;
+const RECEIVE_TIMEOUT_MS = 10 * 60 * 1000; // 10 min max for receiving all chunks
 const MAX_MESSAGE_LENGTH = 1000;
-const RTC_CONFIG: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ],
-};
 
 // --- Supabase client --------------------------------------------------------
 
@@ -158,6 +151,7 @@ function sleep(ms: number): Promise<void> {
 
 const inMemoryFiles = new Map<string, { chunks: ArrayBuffer[]; meta: TransferMeta }>();
 const activeSenderSessions = new Map<string, SenderSession>();
+const cancelledPins = new Set<string>();
 
 // --- PIN → Ticket store (Supabase + localStorage) ---------------------------
 
@@ -279,13 +273,14 @@ async function deleteTicket(pin: string): Promise<void> {
 
 // --- Connection Handshake ---------------------------------------------------
 //
-// Uses the `receiver_status` and `sender_status` columns on transfer_tickets
-// to coordinate a connection-first flow:
+// Uses `receiver_status` and `sender_status` columns on transfer_tickets:
 //   1. Receiver resolves PIN → sets receiver_status = 'connected'
 //   2. Sender detects receiver_status = 'connected' → sets sender_status = 'ack'
 //   3. Receiver detects sender_status = 'ack' → connection confirmed
 //
-// This ensures both sides know the other is present before transferring.
+// The sender starts watching IMMEDIATELY after publishing the ticket
+// (auto-start, no button click needed). This eliminates the race condition
+// where the receiver signals before the sender is watching.
 
 async function receiverSignalConnected(pin: string): Promise<void> {
   if (!supabase) return;
@@ -311,357 +306,7 @@ async function senderAckConnected(pin: string): Promise<void> {
   }
 }
 
-async function waitForReceiverConnection(pin: string): Promise<boolean> {
-  if (!supabase) {
-    // No Supabase — check localStorage (same-device)
-    return inMemoryFiles.has(pin);
-  }
-
-  const deadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    try {
-      const { data, error } = await supabase
-        .from('transfer_tickets')
-        .select('receiver_status')
-        .eq('pin', pin)
-        .maybeSingle();
-
-      if (!error && data?.receiver_status === 'connected') {
-        await senderAckConnected(pin);
-        return true;
-      }
-    } catch {
-      /* keep polling */
-    }
-
-    // Also check same-device fast path
-    if (inMemoryFiles.has(pin) && localStorage.getItem(STORAGE_PREFIX + pin)) {
-      return true;
-    }
-
-    await sleep(HANDSHAKE_POLL_MS);
-  }
-
-  return false;
-}
-
-async function waitForSenderAck(pin: string): Promise<boolean> {
-  if (!supabase) return true; // same-device, no ack needed
-
-  const deadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    try {
-      const { data, error } = await supabase
-        .from('transfer_tickets')
-        .select('sender_status')
-        .eq('pin', pin)
-        .maybeSingle();
-
-      if (!error && data?.sender_status === 'ack') {
-        return true;
-      }
-    } catch {
-      /* keep polling */
-    }
-    await sleep(HANDSHAKE_POLL_MS);
-  }
-
-  return false;
-}
-
-// --- WebRTC Signaling via Supabase Realtime ---------------------------------
-
-type SignalPayload =
-  | { type: 'offer'; sdp: string }
-  | { type: 'answer'; sdp: string }
-  | { type: 'ice'; candidate: string; sdpMid: string | null; sdpMLineIndex: number | null };
-
-let signalChannel: RealtimeChannel | null = null;
-
-function joinSignalChannel(pin: string, onSignal: (payload: SignalPayload) => void): void {
-  if (!supabase) return;
-
-  if (signalChannel) {
-    void supabase.removeChannel(signalChannel);
-    signalChannel = null;
-  }
-
-  signalChannel = supabase
-    .channel(`signal:${pin}`)
-    .on('broadcast', { event: 'signal' }, (payload: { payload: SignalPayload }) => {
-      onSignal(payload.payload);
-    })
-    .subscribe();
-}
-
-function sendSignal(pin: string, payload: SignalPayload): void {
-  if (!signalChannel) return;
-  void signalChannel.send({ type: 'broadcast', event: 'signal', payload });
-}
-
-function leaveSignalChannel(): void {
-  if (signalChannel && supabase) {
-    void supabase.removeChannel(signalChannel);
-    signalChannel = null;
-  }
-}
-
-// --- WebRTC Sender -----------------------------------------------------------
-
-async function sendViaWebRTC(
-  pin: string,
-  file: File,
-  chunks: ArrayBuffer[],
-  cb: TransferCallbacks,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    const dc = pc.createDataChannel('file-transfer', { ordered: true });
-    let transferred = 0;
-    const startTime = Date.now();
-    let chunkIndex = 0;
-    let resolved = false;
-
-    const cleanup = () => {
-      dc.close();
-      pc.close();
-      leaveSignalChannel();
-    };
-
-    const fail = (msg: string) => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      cb.onError(msg);
-      reject(new Error(msg));
-    };
-
-    cb.onStage('Connecting...');
-
-    joinSignalChannel(pin, async (signal) => {
-      try {
-        if (signal.type === 'answer') {
-          await pc.setRemoteDescription({ type: 'answer', sdp: signal.sdp });
-        } else if (signal.type === 'ice') {
-          await pc.addIceCandidate({
-            candidate: signal.candidate,
-            sdpMid: signal.sdpMid,
-            sdpMLineIndex: signal.sdpMLineIndex,
-          });
-        }
-      } catch (err) {
-        fail(`Signaling error: ${(err as Error).message}`);
-      }
-    });
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        sendSignal(pin, {
-          type: 'ice',
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-        });
-      }
-    };
-
-    dc.onopen = () => {
-      cb.onStage('Actively Streaming Data');
-      sendNext();
-    };
-
-    dc.onclose = () => {
-      if (!resolved) {
-        if (chunkIndex >= chunks.length) {
-          resolved = true;
-          cb.onStage('Transfer Complete');
-          cleanup();
-          resolve();
-        } else {
-          fail('Connection closed before transfer completed');
-        }
-      }
-    };
-
-    dc.onerror = () => fail('Data channel error');
-
-    function sendNext() {
-      if (dc.bufferedAmount > 4 * 1024 * 1024) {
-        setTimeout(sendNext, 20);
-        return;
-      }
-      if (chunkIndex >= chunks.length) {
-        dc.send(JSON.stringify({ done: true }));
-        setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            cb.onStage('Transfer Complete');
-            cleanup();
-            resolve();
-          }
-        }, 500);
-        return;
-      }
-      const chunk = chunks[chunkIndex];
-      dc.send(chunk);
-      transferred += chunk.byteLength;
-      chunkIndex++;
-
-      const elapsed = (Date.now() - startTime) / 1000;
-      cb.onProgress({
-        percent: Math.round((transferred / file.size) * 100),
-        bytesTransferred: transferred,
-        totalBytes: file.size,
-        speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-        eta: calcEta(file.size - transferred, transferred / Math.max(elapsed, 0.1)),
-      });
-
-      sendNext();
-    }
-
-    pc.createOffer()
-      .then((offer) => pc.setLocalDescription(offer))
-      .then(() => {
-        sendSignal(pin, { type: 'offer', sdp: pc.localDescription!.sdp ?? '' });
-      })
-      .catch((err) => fail(`Failed to create offer: ${(err as Error).message}`));
-
-    setTimeout(() => {
-      if (!resolved && dc.readyState !== 'open') {
-        fail('Connection timed out — the receiver may not be online');
-      }
-    }, 30000);
-  });
-}
-
-// --- WebRTC Receiver --------------------------------------------------------
-
-async function receiveViaWebRTC(
-  pin: string,
-  totalSize: number,
-  fileType: string,
-  cb: TransferCallbacks,
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    let dc: RTCDataChannel | null = null;
-    const receivedChunks: ArrayBuffer[] = [];
-    let transferred = 0;
-    const startTime = Date.now();
-    let resolved = false;
-
-    const cleanup = () => {
-      if (dc) dc.close();
-      pc.close();
-      leaveSignalChannel();
-    };
-
-    const fail = (msg: string) => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      cb.onError(msg);
-      reject(new Error(msg));
-    };
-
-    cb.onStage('Connecting...');
-
-    joinSignalChannel(pin, async (signal) => {
-      try {
-        if (signal.type === 'offer') {
-          await pc.setRemoteDescription({ type: 'offer', sdp: signal.sdp });
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          sendSignal(pin, { type: 'answer', sdp: answer.sdp ?? '' });
-        } else if (signal.type === 'ice') {
-          await pc.addIceCandidate({
-            candidate: signal.candidate,
-            sdpMid: signal.sdpMid,
-            sdpMLineIndex: signal.sdpMLineIndex,
-          });
-        }
-      } catch (err) {
-        fail(`Signaling error: ${(err as Error).message}`);
-      }
-    });
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        sendSignal(pin, {
-          type: 'ice',
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-        });
-      }
-    };
-
-    pc.ondatachannel = (event) => {
-      dc = event.channel;
-      cb.onStage('Actively Streaming Data');
-
-      dc.onmessage = (event) => {
-        if (typeof event.data === 'string') {
-          try {
-            const msg = JSON.parse(event.data);
-            if (msg.done) {
-              resolved = true;
-              cb.onStage('Transfer Complete');
-              const url = URL.createObjectURL(
-                new Blob(receivedChunks, { type: fileType }),
-              );
-              cleanup();
-              resolve(url);
-              return;
-            }
-          } catch {
-            /* not JSON */
-          }
-        }
-
-        if (event.data instanceof ArrayBuffer) {
-          receivedChunks.push(event.data);
-          transferred += event.data.byteLength;
-
-          const elapsed = (Date.now() - startTime) / 1000;
-          cb.onProgress({
-            percent: Math.round((transferred / totalSize) * 100),
-            bytesTransferred: transferred,
-            totalBytes: totalSize,
-            speed: formatSpeed(transferred / Math.max(elapsed, 0.1)),
-            eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
-          });
-        }
-      };
-
-      dc.onclose = () => {
-        if (!resolved) {
-          if (transferred >= totalSize) {
-            resolved = true;
-            cb.onStage('Transfer Complete');
-            const url = URL.createObjectURL(
-              new Blob(receivedChunks, { type: fileType }),
-            );
-            cleanup();
-            resolve(url);
-          } else {
-            fail('Connection closed before transfer completed');
-          }
-        }
-      };
-
-      dc.onerror = () => fail('Data channel error');
-    };
-
-    setTimeout(() => {
-      if (!resolved && (!dc || dc.readyState !== 'open')) {
-        fail('Connection timed out — the sender may not be online');
-      }
-    }, 30000);
-  });
-}
-
-// --- Supabase Chunk Relay (fallback transport) ------------------------------
+// --- Supabase Chunk Relay (primary transport) -------------------------------
 
 async function sendViaSupabaseChunks(
   pin: string,
@@ -676,6 +321,10 @@ async function sendViaSupabaseChunks(
   const startTime = Date.now();
 
   for (let i = 0; i < chunks.length; i++) {
+    if (cancelledPins.has(pin)) {
+      throw new Error('Transfer cancelled');
+    }
+
     const b64 = arrayBufferToBase64(chunks[i]);
     let retries = 0;
     const maxRetries = 5;
@@ -735,42 +384,15 @@ async function receiveViaSupabaseChunks(
   const startTime = Date.now();
   const expectedChunks = Math.ceil(totalSize / CHUNK_SIZE);
 
-  // Wait for sender to signal chunks_ready, or start polling as chunks arrive
-  let chunksReady = false;
-  const readyDeadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
-  while (Date.now() < readyDeadline && !chunksReady) {
-    try {
-      const { data } = await supabase
-        .from('transfer_tickets')
-        .select('sender_status')
-        .eq('pin', pin)
-        .maybeSingle();
-      if (data?.sender_status === 'chunks_ready') {
-        chunksReady = true;
-        break;
-      }
-    } catch {
-      /* keep polling */
-    }
-
-    // Also check if chunks are already arriving
-    const { count } = await supabase
-      .from('transfer_chunks')
-      .select('id', { count: 'exact', head: true })
-      .eq('pin', pin);
-    if (count && count > 0) {
-      // Chunks are arriving — start receiving them as they come
-      break;
-    }
-
-    await sleep(500);
-  }
-
   // Poll for chunks until we have them all
   let nextIndex = 0;
-  const pollDeadline = Date.now() + 5 * 60 * 1000; // 5 min max for receiving
+  const pollDeadline = Date.now() + RECEIVE_TIMEOUT_MS;
 
   while (nextIndex < expectedChunks && Date.now() < pollDeadline) {
+    if (cancelledPins.has(pin)) {
+      throw new Error('Transfer cancelled');
+    }
+
     try {
       const { data, error } = await supabase
         .from('transfer_chunks')
@@ -796,7 +418,7 @@ async function receiveViaSupabaseChunks(
           eta: calcEta(totalSize - transferred, transferred / Math.max(elapsed, 0.1)),
         });
       } else {
-        await sleep(300);
+        await sleep(CHUNK_POLL_MS);
       }
     } catch {
       await sleep(500);
@@ -804,7 +426,7 @@ async function receiveViaSupabaseChunks(
   }
 
   if (nextIndex < expectedChunks) {
-    throw new Error('Transfer timed out — not all file chunks were received');
+    throw new Error('Transfer timed out — not all file chunks were received. Ask the sender to try again.');
   }
 
   const url = URL.createObjectURL(new Blob(receivedChunks, { type: fileType }));
@@ -896,7 +518,6 @@ export function leaveChat(): void {
     void supabase.removeChannel(chatChannel);
     chatChannel = null;
   }
-  leaveSignalChannel();
 }
 
 // --- Public API: Sender ------------------------------------------------------
@@ -915,9 +536,7 @@ export async function initSenderEngine(
     fileType: file.type || 'application/octet-stream',
   };
 
-  // Pre-chunk the file for both WebRTC and Supabase relay paths
-  const chunkSize = supabase ? CHUNK_SIZE : WEBRTC_CHUNK_SIZE;
-  const chunks = await fileToChunks(file, chunkSize);
+  const chunks = await fileToChunks(file, CHUNK_SIZE);
   inMemoryFiles.set(pin, { chunks, meta });
 
   await publishTicket(pin, meta);
@@ -928,7 +547,12 @@ export async function initSenderEngine(
   return session;
 }
 
-export async function streamSenderFile(
+/**
+ * Auto-starts the sender's watch for a receiver. Polls the ticket's
+ * receiver_status until it becomes 'connected', then acks and begins
+ * uploading chunks. This runs in the background — no user interaction needed.
+ */
+export async function startSenderWatch(
   pin: string,
   cb?: TransferCallbacks,
 ): Promise<void> {
@@ -945,6 +569,7 @@ export async function streamSenderFile(
     let transferred = 0;
     const startTime = Date.now();
     for (const chunk of stored.chunks) {
+      if (cancelledPins.has(pin)) return;
       await sleep(5);
       transferred += chunk.byteLength;
       const elapsed = (Date.now() - startTime) / 1000;
@@ -969,37 +594,77 @@ export async function streamSenderFile(
     return;
   }
 
-  // --- Connection-first handshake ---
-  cbs.onStage('Connecting...');
+  // --- Wait for receiver to connect ---
+  cbs.onStage('Waiting for Peer...');
 
-  // Wait for receiver to signal it's connected
-  const receiverReady = await waitForReceiverConnection(pin);
-  if (!receiverReady) {
-    cbs.onError('No receiver connected within the timeout. Ask the receiver to enter the code again.');
-    return;
-  }
+  const watchDeadline = Date.now() + SENDER_WATCH_TIMEOUT_MS;
+  let receiverConnected = false;
 
-  cbs.onStage('Connected');
+  while (Date.now() < watchDeadline) {
+    if (cancelledPins.has(pin)) {
+      cbs.onStage('Idle');
+      return;
+    }
 
-  // Try WebRTC first (faster, true P2P), fall back to Supabase chunk relay
-  try {
-    await sendViaWebRTC(pin, session.file, stored.chunks, cbs);
-    activeSenderSessions.delete(pin);
-  } catch (webrtcErr) {
-    console.warn('WebRTC failed, falling back to Supabase chunk relay:', (webrtcErr as Error).message);
-
-    // Re-chunk at Supabase relay size if needed
-    if (stored.chunks[0]?.byteLength !== CHUNK_SIZE) {
-      stored.chunks = await fileToChunks(session.file, CHUNK_SIZE);
-      inMemoryFiles.set(pin, stored);
+    // Check same-device fast path
+    if (inMemoryFiles.has(pin) && localStorage.getItem(STORAGE_PREFIX + pin)) {
+      receiverConnected = true;
+      break;
     }
 
     try {
-      await sendViaSupabaseChunks(pin, session.file, stored.chunks, cbs);
-      activeSenderSessions.delete(pin);
-    } catch (relayErr) {
-      cbs.onError((relayErr as Error).message);
+      const { data, error } = await supabase
+        .from('transfer_tickets')
+        .select('receiver_status')
+        .eq('pin', pin)
+        .maybeSingle();
+
+      if (!error && data?.receiver_status === 'connected') {
+        receiverConnected = true;
+        break;
+      }
+    } catch {
+      /* keep polling */
     }
+
+    await sleep(SENDER_WATCH_POLL_MS);
+  }
+
+  if (!receiverConnected) {
+    if (!cancelledPins.has(pin)) {
+      cbs.onError('No receiver connected within the timeout. The pairing code has expired.');
+    }
+    return;
+  }
+
+  // Ack the receiver
+  await senderAckConnected(pin);
+  cbs.onStage('Connected');
+
+  // Small delay to let receiver see the ack before we start uploading
+  await sleep(500);
+
+  // Start uploading chunks
+  try {
+    await sendViaSupabaseChunks(pin, session.file, stored.chunks, cbs);
+    activeSenderSessions.delete(pin);
+  } catch (error) {
+    if (!cancelledPins.has(pin)) {
+      cbs.onError((error as Error).message);
+    }
+  }
+}
+
+export function cancelSenderWatch(pin: string): void {
+  cancelledPins.add(pin);
+  activeSenderSessions.delete(pin);
+  inMemoryFiles.delete(pin);
+  leaveChat();
+  // Clean up Supabase data
+  if (supabase) {
+    void supabase.from('transfer_tickets').delete().eq('pin', pin);
+    void supabase.from('transfer_chunks').delete().eq('pin', pin);
+    void supabase.from('transfer_chat').delete().eq('pin', pin);
   }
 }
 
@@ -1064,22 +729,36 @@ export async function initReceiverEngine(
   // Signal to sender that receiver is connected
   await receiverSignalConnected(pin);
 
-  // Wait for sender to ack
-  const senderAcked = await waitForSenderAck(pin);
+  // Wait for sender to ack — the sender is auto-watching, so this should be fast
+  const ackDeadline = Date.now() + RECEIVER_ACK_TIMEOUT_MS;
+  let senderAcked = false;
+
+  while (Date.now() < ackDeadline) {
+    try {
+      const { data, error } = await supabase
+        .from('transfer_tickets')
+        .select('sender_status')
+        .eq('pin', pin)
+        .maybeSingle();
+
+      if (!error && (data?.sender_status === 'ack' || data?.sender_status === 'chunks_ready')) {
+        senderAcked = true;
+        break;
+      }
+    } catch {
+      /* keep polling */
+    }
+    await sleep(RECEIVER_ACK_POLL_MS);
+  }
+
   if (!senderAcked) {
-    throw new Error('Sender did not respond within the timeout. Make sure the sender has pressed "Start secure transfer".');
+    throw new Error('Sender did not respond within the timeout. Make sure the sender has selected a file and their pairing code is active.');
   }
 
   cbs.onStage('Connected');
 
-  // Try WebRTC first, fall back to Supabase chunk relay
-  let downloadUrl: string;
-  try {
-    downloadUrl = await receiveViaWebRTC(pin, entry.fileSize, entry.fileType, cbs);
-  } catch (webrtcErr) {
-    console.warn('WebRTC receive failed, falling back to Supabase chunk relay:', (webrtcErr as Error).message);
-    downloadUrl = await receiveViaSupabaseChunks(pin, entry.fileSize, entry.fileType, cbs);
-  }
+  // Start receiving chunks
+  const downloadUrl = await receiveViaSupabaseChunks(pin, entry.fileSize, entry.fileType, cbs);
 
   cbs.onStage('Transfer Complete');
   cbs.onComplete(downloadUrl, entry.fileName, entry.fileSize);

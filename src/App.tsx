@@ -8,7 +8,7 @@ import {
   ScanLine,
 } from 'lucide-react';
 import {
-  initReceiverEngine, initSenderEngine, streamSenderFile,
+  initReceiverEngine, initSenderEngine, startSenderWatch, cancelSenderWatch,
   joinChat, sendChatMessage, loadChatHistory, leaveChat, isSupabaseConfigured,
   type ChatMessage, type SenderSession, type TransferCallbacks,
   type TransferProgress, type TransferStage,
@@ -151,6 +151,8 @@ function App() {
       const session = await initSenderEngine(nextFile, callbacksRef.current);
       setPin(session.pairingPin);
       setSenderSession(session);
+      // Auto-start watching for receiver — no button click needed
+      void startSenderWatch(session.pairingPin, callbacksRef.current);
     } catch (error) {
       setErrorMessage((error as Error).message);
       setStage('Idle');
@@ -185,12 +187,6 @@ function App() {
     setPanel('receive');
   };
 
-  const startSendTransfer = async () => {
-    if (!file || !senderSession) return;
-    setProgress({ percent: 0, bytesTransferred: 0, totalBytes: file.size, speed: 0, eta: 0 });
-    await streamSenderFile(senderSession.pairingPin, callbacksRef.current);
-  };
-
   const startReceiveTransfer = async () => {
     setErrorMessage('');
     setProgress({ percent: 0, bytesTransferred: 0, totalBytes: 0, speed: 0, eta: 0 });
@@ -221,6 +217,7 @@ function App() {
   };
 
   const clearSession = () => {
+    if (senderSession) cancelSenderWatch(senderSession.pairingPin);
     setFile(null);
     setStage('Idle');
     setProgress(null);
@@ -290,19 +287,14 @@ function App() {
 
             {file && stage === 'Connected' && (
               <div className="connection-confirmed">
-                <Check size={16} /> Receiver connected! Ready to transmit.
+                <Check size={16} /> Receiver connected! Starting transfer...
               </div>
             )}
 
-            {file && (stage === 'Waiting for Peer...' || stage === 'Connected') && (
-              <button className="primary-button wide" onClick={startSendTransfer} disabled={stage === 'Connected'}>
-                {stage === 'Connected' ? <><Check size={16} /> Connection ready — transmitting...</> : <><Send size={16} /> Start secure transfer <ChevronRight size={16} /></>}
-              </button>
-            )}
-            {file && stage === 'Connecting...' && (
-              <button className="primary-button wide" disabled>
-                <span className="live-dot" /> Connecting to peer...
-              </button>
+            {file && stage === 'Actively Streaming Data' && (
+              <div className="connection-confirmed">
+                <span className="live-dot" /> Uploading file to relay...
+              </div>
             )}
             {downloadUrl && stage === 'Transfer Complete' && <a className="primary-button wide" href={downloadUrl} download={downloadName}><ArrowDownToLine size={16} /> Download {downloadName}</a>}
           </> : (
