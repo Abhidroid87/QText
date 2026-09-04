@@ -76,7 +76,7 @@ footer { justify-content: space-between; color: #53636b; font: 10px 'DM Mono'; p
 /* --- Landing cards --- */
 .landing-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 8px; }
 .landing-card { background: #11191e; border: 1px solid #27343b; border-radius: 13px; padding: 30px; text-align: left; transition: .22s ease; position: relative; overflow: hidden; }
-.landing-card::before { content: ''; position: absolute; inset: 0; background: radial-gradient(circle at 80% 0%, #77e0bc08, transparent 60%); opacity: 0; transition: .3s ease; }
+.landing-card::before { content: ''; position: absolute; inset: 0; background: radial-gradient(circle at 80% 0%, #77e0bc08, transparent 60%); opacity: 0; transition: .3s ease; pointer-events: none; }
 .landing-card:hover { border-color: #34554d; transform: translateY(-2px); box-shadow: 0 12px 40px rgba(0,0,0,.3); }
 .landing-card:hover::before { opacity: 1; }
 .create-card { cursor: pointer; border: 0; width: 100%; }
