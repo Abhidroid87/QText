@@ -14,7 +14,7 @@
  *   - File metadata: `file_offers` table
  */
 
-import { createClient, type RealtimeChannel } from '@supabase/supabase-js';
+import { createClient, type RealtimeChannel, type Session, type User } from '@supabase/supabase-js';
 
 // --- Types ------------------------------------------------------------------
 
@@ -23,6 +23,7 @@ export type RoomMember = {
   display_name: string;
   role: 'host' | 'member';
   is_online: boolean;
+  is_signed_in: boolean;
 };
 
 export type ChatMessage = {
@@ -60,6 +61,15 @@ export type RoomCallbacks = {
   onFileOfferUpdate: (offer: FileOffer) => void;
   onProgress: (fileId: string, progress: TransferProgress) => void;
   onError: (message: string) => void;
+};
+
+export type RoomHistoryEntry = {
+  id: string;
+  pin: string;
+  display_name: string;
+  role: string;
+  joined_at: number;
+  left_at: number | null;
 };
 
 // --- Constants --------------------------------------------------------------
@@ -157,6 +167,96 @@ export function isSupabaseConfigured(): boolean {
   return true;
 }
 
+// --- Auth --------------------------------------------------------------------
+
+export async function signUpWithEmail(email: string, password: string): Promise<{ error: string | null }> {
+  if (!supabase) return { error: 'Network not available' };
+  const { error } = await supabase.auth.signUp({ email, password });
+  if (error) return { error: error.message };
+  return { error: null };
+}
+
+export async function signInWithEmail(email: string, password: string): Promise<{ error: string | null }> {
+  if (!supabase) return { error: 'Network not available' };
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return { error: error.message };
+  return { error: null };
+}
+
+export async function signOutUser(): Promise<void> {
+  if (!supabase) return;
+  await supabase.auth.signOut();
+}
+
+export async function getCurrentSession(): Promise<Session | null> {
+  if (!supabase) return null;
+  const { data } = await supabase.auth.getSession();
+  return data.session;
+}
+
+export function onAuthChange(callback: (user: User | null) => void): () => void {
+  if (!supabase) return () => {};
+  const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
+    callback(session?.user ?? null);
+  });
+  return () => subscription.subscription.unsubscribe();
+}
+
+export function getCurrentUser(): User | null {
+  if (!supabase) return null;
+  return supabase.auth.getUser().then(({ data }) => data.user).catch(() => null) as unknown as User | null;
+}
+
+// --- Chat history persistence (signed-in users only) ------------------------
+
+export async function saveRoomToHistory(pin: string, displayName: string, role: string): Promise<void> {
+  if (!supabase) return;
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return;
+  try {
+    await supabase.from('user_room_history').insert({
+      user_id: user.id,
+      pin,
+      display_name: displayName,
+      role,
+    });
+  } catch { /* non-fatal */ }
+}
+
+export async function updateHistoryLeftAt(pin: string): Promise<void> {
+  if (!supabase) return;
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return;
+  try {
+    await supabase.from('user_room_history')
+      .update({ left_at: new Date().toISOString() })
+      .eq('user_id', user.id)
+      .eq('pin', pin)
+      .is('left_at', null);
+  } catch { /* non-fatal */ }
+}
+
+export async function loadUserHistory(): Promise<RoomHistoryEntry[]> {
+  if (!supabase) return [];
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return [];
+  const { data, error } = await supabase
+    .from('user_room_history')
+    .select('id, pin, display_name, role, joined_at, left_at')
+    .eq('user_id', user.id)
+    .order('joined_at', { ascending: false })
+    .limit(50);
+  if (error || !data) return [];
+  return data.map((row) => ({
+    id: String(row.id),
+    pin: row.pin,
+    display_name: row.display_name,
+    role: row.role,
+    joined_at: new Date(row.joined_at).getTime(),
+    left_at: row.left_at ? new Date(row.left_at).getTime() : null,
+  }));
+}
+
 export function getCurrentMemberId(): string | null {
   return currentMemberId;
 }
@@ -197,6 +297,9 @@ export async function createRoom(cb: RoomCallbacks): Promise<string> {
 
   // Register as room member
   await joinRoomMember(pin, currentMemberId, currentDisplayName, 'host');
+
+  // Save to history for signed-in users
+  void saveRoomToHistory(pin, currentDisplayName, 'host');
 
   // Start listening
   startRoomListeners(pin, cb);
@@ -240,12 +343,16 @@ export async function joinRoom(pin: string, cb: RoomCallbacks): Promise<void> {
   startRoomListeners(pin, cb);
   startPresence(pin);
 
+  // Save to history for signed-in users
+  void saveRoomToHistory(pin, currentDisplayName, 'member');
+
   // Send system message
   await sendSystemMessage(pin, `${currentDisplayName} joined the room`);
 }
 
 export async function joinRoomMember(pin: string, memberId: string, name: string, role: 'host' | 'member'): Promise<void> {
   if (!supabase) return;
+  const { data: { user } } = await supabase.auth.getUser();
   try {
     await supabase.from('room_members').upsert({
       pin,
@@ -253,6 +360,7 @@ export async function joinRoomMember(pin: string, memberId: string, name: string
       display_name: name,
       role,
       last_seen: new Date().toISOString(),
+      user_id: user?.id ?? null,
     });
   } catch { /* non-fatal */ }
 }
@@ -263,6 +371,7 @@ export function leaveRoom(): void {
     if (currentDisplayName) {
       void sendSystemMessage(currentPin, `${currentDisplayName} left the room`);
     }
+    void updateHistoryLeftAt(currentPin);
   }
   if (roomChannel && supabase) {
     void supabase.removeChannel(roomChannel);
@@ -305,7 +414,7 @@ async function refreshMembers(pin: string): Promise<void> {
   try {
     const { data } = await supabase
       .from('room_members')
-      .select('member_id, display_name, role, last_seen')
+      .select('member_id, display_name, role, last_seen, user_id')
       .eq('pin', pin);
     if (!data) return;
 
@@ -315,6 +424,7 @@ async function refreshMembers(pin: string): Promise<void> {
       display_name: row.display_name,
       role: row.role as 'host' | 'member',
       is_online: now - new Date(row.last_seen).getTime() < PRESENCE_TIMEOUT_MS,
+      is_signed_in: !!row.user_id,
     }));
     callbacksRef.onMembersChange(members);
   } catch { /* non-fatal */ }

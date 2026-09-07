@@ -12,15 +12,22 @@ import {
   FileText,
   Link2,
   LockKeyhole,
+  LogIn,
+  LogOut,
+  MessageSquare,
   MoreHorizontal,
   Plus,
   Radio,
   ScanLine,
   Send,
+  ShieldCheck,
   Users,
   X,
   Zap,
   UploadCloud,
+  Moon,
+  Sun,
+  type LucideIcon,
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import {
@@ -31,18 +38,24 @@ import {
   isSupabaseConfigured,
   joinRoom,
   leaveRoom,
+  loadUserHistory,
+  onAuthChange,
   sendChatMessage,
   shareFile,
+  signInWithEmail,
+  signOutUser,
+  signUpWithEmail,
   type ChatMessage,
   type FileOffer,
+  type RoomHistoryEntry,
   type RoomMember,
   type RoomCallbacks,
   type TransferProgress,
 } from '@/lib/transfer';
+import type { User } from '@supabase/supabase-js';
 import QrScanner from '@/components/QrScanner';
 
 type Screen = 'landing' | 'room';
-type HistoryEntry = { name: string; size: string; status: 'Success' | 'Failed'; timestamp: string };
 
 const formatBytes = (bytes: number) => {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -50,14 +63,7 @@ const formatBytes = (bytes: number) => {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 };
 
-const formatTimestamp = () => {
-  const now = new Date();
-  const h = String(now.getHours()).padStart(2, '0');
-  const m = String(now.getMinutes()).padStart(2, '0');
-  return `Today, ${h}:${m}`;
-};
-
-const fileIconFor = (type: string) => {
+const fileIconFor = (type: string): LucideIcon => {
   if (type.includes('image')) return FileImage;
   if (type.includes('zip') || type.includes('compressed') || type.includes('rar') || type.includes('7z')) return FileArchive;
   if (type.includes('text') || type.includes('pdf') || type.includes('document') || type.includes('msword') || type.includes('officedocument')) return FileText;
@@ -73,6 +79,16 @@ function App() {
   const [showScanner, setShowScanner] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
 
+  // Auth state
+  const [user, setUser] = useState<User | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+  const [userHistory, setUserHistory] = useState<RoomHistoryEntry[]>([]);
+
   // Room state
   const [members, setMembers] = useState<RoomMember[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -81,19 +97,33 @@ function App() {
   const [chatInput, setChatInput] = useState('');
   const [isHost, setIsHost] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const saved = localStorage.getItem('meshdrop-theme');
+    return saved === 'light' ? 'light' : 'dark';
+  });
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('meshdrop-theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme((t) => t === 'dark' ? 'light' : 'dark');
 
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const callbacksRef = useRef<RoomCallbacks | null>(null);
 
-  const [history, setHistory] = useState<HistoryEntry[]>(() => {
-    const saved = localStorage.getItem('meshdrop-history');
-    return saved ? JSON.parse(saved) as HistoryEntry[] : [];
-  });
-
   useEffect(() => {
-    localStorage.setItem('meshdrop-history', JSON.stringify(history));
-  }, [history]);
+    const unsubscribe = onAuthChange((u) => {
+      setUser(u);
+      if (u) {
+        void loadUserHistory().then(setUserHistory);
+      } else {
+        setUserHistory([]);
+      }
+    });
+    return unsubscribe;
+  }, []);
 
   useEffect(() => {
     if (chatScrollRef.current) {
@@ -172,16 +202,8 @@ function App() {
   const handleFileSelect = async (file: File) => {
     try {
       await shareFile(file);
-      setHistory((prev) => [
-        { name: file.name, size: formatBytes(file.size), status: 'Success', timestamp: formatTimestamp() },
-        ...prev,
-      ]);
     } catch (error) {
       setErrorMessage((error as Error).message);
-      setHistory((prev) => [
-        { name: file.name, size: formatBytes(file.size), status: 'Failed', timestamp: formatTimestamp() },
-        ...prev,
-      ]);
     }
   };
 
@@ -206,10 +228,6 @@ function App() {
       a.download = offer.file_name;
       a.click();
       URL.revokeObjectURL(url);
-      setHistory((prev) => [
-        { name: offer.file_name, size: formatBytes(offer.file_size), status: 'Success', timestamp: formatTimestamp() },
-        ...prev,
-      ]);
     } catch (error) {
       setErrorMessage((error as Error).message);
     }
@@ -231,11 +249,84 @@ function App() {
     setProgress({});
     setPinDigits(['', '', '', '', '', '']);
     setIsHost(false);
+    if (user) void loadUserHistory().then(setUserHistory);
+  };
+
+  const handleAuth = async () => {
+    setAuthError('');
+    setAuthLoading(true);
+    try {
+      const result = authMode === 'signin'
+        ? await signInWithEmail(authEmail, authPassword)
+        : await signUpWithEmail(authEmail, authPassword);
+      if (result.error) {
+        setAuthError(result.error);
+      } else {
+        setShowAuthModal(false);
+        setAuthEmail('');
+        setAuthPassword('');
+      }
+    } catch (error) {
+      setAuthError((error as Error).message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await signOutUser();
+    setUser(null);
+    setUserHistory([]);
   };
 
   const myId = getCurrentMemberId();
   const myName = getCurrentDisplayName();
   const supabaseReady = isSupabaseConfigured();
+
+  // --- Auth modal ---
+  const renderAuthModal = () => {
+    if (!showAuthModal) return null;
+    return (
+      <div className="modal-backdrop" onClick={() => setShowAuthModal(false)}>
+        <div className="auth-modal" onClick={(e) => e.stopPropagation()}>
+          <button className="modal-close" onClick={() => setShowAuthModal(false)} aria-label="Close"><X size={18} /></button>
+          <div className="auth-modal-header">
+            <div className="auth-modal-icon"><ShieldCheck size={26} /></div>
+            <h2>{authMode === 'signin' ? 'Welcome back' : 'Create your account'}</h2>
+            <p>{authMode === 'signin' ? 'Sign in to access your chat history and room logs.' : 'Sign up to save your transfer history across sessions.'}</p>
+          </div>
+          {authError && <div className="auth-error">{authError}</div>}
+          <div className="auth-form">
+            <input
+              type="email"
+              placeholder="Email address"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              className="auth-input"
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') void handleAuth(); }}
+              className="auth-input"
+            />
+            <button className="primary-button auth-submit" onClick={handleAuth} disabled={authLoading || !authEmail || !authPassword}>
+              {authLoading ? 'Please wait...' : authMode === 'signin' ? 'Sign in' : 'Sign up'}
+            </button>
+          </div>
+          <div className="auth-switch">
+            {authMode === 'signin' ? (
+              <>Don't have an account? <button onClick={() => { setAuthMode('signup'); setAuthError(''); }}>Sign up</button></>
+            ) : (
+              <>Already have an account? <button onClick={() => { setAuthMode('signin'); setAuthError(''); }}>Sign in</button></>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   // --- Landing screen ---
   if (screen === 'landing') {
@@ -243,7 +334,23 @@ function App() {
       <main className="app-shell">
         <header className="topbar">
           <div className="brand-lockup"><div className="brand-mark"><Zap size={17} strokeWidth={2.7} /></div><span>mesh<span>drop</span></span><small>BETA</small></div>
-          <div className="topbar-right"><div className="network-pill"><span className="live-dot" /> {supabaseReady ? 'Network online' : 'Local mode'}</div><div className="divider" /><button className="icon-button" aria-label="More options"><MoreHorizontal size={20} /></button><button className="avatar" aria-label="Session">M</button></div>
+          <div className="topbar-right">
+            <div className="network-pill"><span className="live-dot" /> {supabaseReady ? 'Network online' : 'Local mode'}</div>
+            <div className="divider" />
+            {user ? (
+              <>
+                <div className="user-pill"><ShieldCheck size={14} /> {user.email}</div>
+                <div className="divider" />
+                <button className="secondary-button compact" onClick={handleSignOut}><LogOut size={14} /> Sign out</button>
+              </>
+            ) : (
+              <button className="secondary-button compact" onClick={() => { setAuthMode('signin'); setAuthError(''); setShowAuthModal(true); }}><LogIn size={14} /> Sign in</button>
+            )}
+            <div className="divider" />
+            <button className="theme-toggle" onClick={toggleTheme} aria-label="Toggle theme">{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button>
+            <div className="divider" />
+            <button className="icon-button" aria-label="More options"><MoreHorizontal size={20} /></button>
+          </div>
         </header>
 
         <section className="hero-row">
@@ -290,17 +397,88 @@ function App() {
           </div>
         </section>
 
-        {history.length > 0 && (
-          <section className="history-section">
-            <div className="history-header"><div><span className="section-kicker">RECENT</span><h2>Transfer history</h2></div></div>
-            <div className="history-table">
-              <div className="history-row history-heading"><span>FILE</span><span>SIZE</span><span>STATUS</span><span>WHEN</span><span /></div>
-              {history.map((entry) => (
-                <div className="history-row" key={`${entry.name}-${entry.timestamp}`}>
-                  <span className="history-file"><span className="history-file-icon"><FileIcon size={15} /></span><strong>{entry.name}</strong></span>
-                  <span>{entry.size}</span>
-                  <span className={entry.status === 'Success' ? 'success-status' : 'failed-status'}><span /> {entry.status}</span>
-                  <span>{entry.timestamp}</span><button aria-label={`Open ${entry.name}`}><ChevronRight size={16} /></button>
+        {/* How it works */}
+        <section className="how-it-works">
+          <div className="section-header">
+            <span className="section-kicker">GETTING STARTED</span>
+            <h2>How it works</h2>
+          </div>
+          <div className="steps-grid">
+            <div className="step-card">
+              <div className="step-number">1</div>
+              <div className="step-icon"><ArrowUpFromLine size={22} /></div>
+              <h3>Create a room</h3>
+              <p>Click "Create a room" to get a 6-digit code and QR instantly. No sign-up needed.</p>
+            </div>
+            <div className="step-card">
+              <div className="step-number">2</div>
+              <div className="step-icon"><Users size={22} /></div>
+              <h3>Share the code</h3>
+              <p>Send the 6-digit code or QR to anyone. They enter it or scan to join your room.</p>
+            </div>
+            <div className="step-card">
+              <div className="step-number">3</div>
+              <div className="step-icon"><MessageSquare size={22} /></div>
+              <h3>Chat & connect</h3>
+              <p>Start chatting in real-time. See who's online and exchange messages instantly.</p>
+            </div>
+            <div className="step-card">
+              <div className="step-number">4</div>
+              <div className="step-icon"><ArrowDownToLine size={22} /></div>
+              <h3>Share files</h3>
+              <p>Drag a file into the chat or click the + button. Others can download it with one click.</p>
+            </div>
+          </div>
+        </section>
+
+        {/* What you can share */}
+        <section className="what-you-can-share">
+          <div className="section-header">
+            <span className="section-kicker">CAPABILITIES</span>
+            <h2>What you can share</h2>
+          </div>
+          <div className="features-grid">
+            <div className="feature-item"><div className="feature-icon"><FileImage size={20} /></div><div><strong>Images</strong><p>JPG, PNG, GIF, WebP, SVG</p></div></div>
+            <div className="feature-item"><div className="feature-icon"><FileText size={20} /></div><div><strong>Documents</strong><p>PDF, Word, Excel, plain text</p></div></div>
+            <div className="feature-item"><div className="feature-icon"><FileArchive size={20} /></div><div><strong>Archives</strong><p>ZIP, RAR, 7Z, tar.gz</p></div></div>
+            <div className="feature-item"><div className="feature-icon"><FileCode2 size={20} /></div><div><strong>Code files</strong><p>JS, TS, JSON, Python, more</p></div></div>
+            <div className="feature-item"><div className="feature-icon"><FileIcon size={20} /></div><div><strong>Any file</strong><p>No type restrictions, up to 50MB</p></div></div>
+            <div className="feature-item"><div className="feature-icon"><MessageSquare size={20} /></div><div><strong>Real-time chat</strong><p>Text messages with instant delivery</p></div></div>
+          </div>
+        </section>
+
+        {/* Sign-in benefits */}
+        {!user && (
+          <section className="auth-benefits">
+            <div className="auth-benefits-content">
+              <div className="auth-benefits-icon"><ShieldCheck size={28} /></div>
+              <div className="auth-benefits-text">
+                <h2>Want to keep track of your transfers?</h2>
+                <p>Sign in (optional) to save your room history, chat logs, and transfer records. Unsigned users get the same real-time chat and file sharing — but their history disappears when they leave.</p>
+              </div>
+              <button className="primary-button" onClick={() => { setAuthMode('signup'); setAuthError(''); setShowAuthModal(true); }}>
+                <ShieldCheck size={16} /> Create account
+              </button>
+            </div>
+          </section>
+        )}
+
+        {/* Signed-in user history */}
+        {user && userHistory.length > 0 && (
+          <section className="user-history-section">
+            <div className="section-header">
+              <span className="section-kicker">YOUR ROOM HISTORY</span>
+              <h2>Recent rooms</h2>
+            </div>
+            <div className="history-cards">
+              {userHistory.map((entry) => (
+                <div className="history-card" key={entry.id}>
+                  <div className="history-card-pin">{entry.pin.slice(0, 3)} {entry.pin.slice(3)}</div>
+                  <div className="history-card-info">
+                    <span className="history-card-role">{entry.role === 'host' ? 'Host' : 'Member'}</span>
+                    <span className="history-card-name">{entry.display_name}</span>
+                    <span className="history-card-time">{new Date(entry.joined_at).toLocaleDateString()} {new Date(entry.joined_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  </div>
                 </div>
               ))}
             </div>
@@ -310,6 +488,7 @@ function App() {
         <footer><span><Zap size={13} /> meshdrop</span><span>Built for direct connections <span className="footer-dot">·</span> No accounts required</span></footer>
 
         {showScanner && <QrScanner onScan={(code) => { setShowScanner(false); void handleJoinRoom(code); }} onClose={() => setShowScanner(false)} />}
+        {renderAuthModal()}
       </main>
     );
   }
@@ -327,7 +506,15 @@ function App() {
           <div className="divider" />
           <div className="members-pill"><Users size={14} /> {onlineMembers.length}</div>
           <div className="divider" />
+          {user ? (
+            <div className="user-pill"><ShieldCheck size={14} /> Signed in</div>
+          ) : (
+            <div className="unsigned-pill"><LockKeyhole size={14} /> Guest</div>
+          )}
+          <div className="divider" />
           <button className="secondary-button compact" onClick={copyLink}>{copied ? <Check size={14} /> : <Link2 size={14} />} {copied ? 'Copied' : 'Copy link'}</button>
+          <div className="divider" />
+          <button className="theme-toggle" onClick={toggleTheme} aria-label="Toggle theme">{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}</button>
           <div className="divider" />
           <button className="leave-button" onClick={handleLeaveRoom}><X size={16} /> Leave</button>
         </div>
@@ -355,6 +542,11 @@ function App() {
                     <strong>{m.display_name}{m.member_id === myId ? ' (You)' : ''}</strong>
                     <span>{m.role === 'host' ? 'Host' : 'Member'}</span>
                   </div>
+                  {m.is_signed_in ? (
+                    <span className="member-badge signed" title="Signed-in user"><ShieldCheck size={12} /></span>
+                  ) : (
+                    <span className="member-badge unsigned" title="Guest user"><LockKeyhole size={12} /></span>
+                  )}
                   <span className="member-status online" />
                 </div>
               ))}
@@ -465,6 +657,7 @@ function App() {
       </div>
 
       {errorMessage && <div className="error-toast"><X size={15} /> {errorMessage} <button onClick={() => setErrorMessage('')}><X size={13} /></button></div>}
+      {renderAuthModal()}
     </main>
   );
 }

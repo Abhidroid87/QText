@@ -1,46 +1,76 @@
 # Meshdrop
 
-A zero-sign-in, serverless peer-to-peer (P2P) file transfer platform inspired by Send Anywhere. Files move directly between browsers — no accounts, no uploads to a central server, no trace left behind.
+A zero-sign-in, room-based real-time chat and file transfer platform. Create a room, share a 6-digit code, and anyone can join to chat and share files instantly — no accounts, no uploads to a central server, no trace left behind.
 
 ## Features
 
-- **No sign-in required** — the entire app is anonymous and tied to your current browser tab session
-- **Send files** — drag-and-drop a file, get a 6-digit pairing code and QR code to share
-- **Receive files** — enter the 6-digit code to download the file
-- **Live transfer metrics** — real-time progress bar, transfer speed (MB/s), ETA, and bytes written
-- **Transfer history** — stored locally in your browser only (never sent to a server)
-- **10-minute expiration** — pairing codes auto-expire after 10 minutes for security
-- **Dark cyber-tech UI** — sleek, minimalist, responsive from mobile to desktop
+- **No sign-in required** — the entire app works anonymously. Create or join a room in seconds.
+- **Room-based chat** — real-time text messaging with anyone in the room, delivered via Supabase Realtime broadcast.
+- **File sharing** — drag-and-drop or click to share any file (images, documents, archives, code, up to ~50MB). Files are chunked and relayed through Supabase for reliable cross-device delivery.
+- **Multi-person rooms** — multiple people can join the same room. See who's online with live presence tracking.
+- **QR code sharing** — each room generates a QR code for instant joining via camera scan.
+- **Optional sign-in** — signed-in users get access to their room history (rooms visited, role, timestamps). Unsigned users get the same chat and file sharing but no persistent history.
+- **Signed/guest badges** — in the room sidebar, signed-in users can see who is signed in vs. guest. Guest users see the same chat experience without badges.
+- **10-minute auto-expiration** — rooms auto-expire after 10 minutes for security and resource cleanup.
+- **Dark, premium UI** — sleek, minimalist, responsive from mobile to desktop with micro-interactions and hover states.
 
 ## How It Works
 
 ```
-Sender (Browser A)                    Receiver (Browser B)
+Person A (Host)                        Person B (Joiner)
      │                                      │
-     ├─ Selects a file                       │
-     ├─ Engine generates a 6-digit PIN       │
-     ├─ PIN → ticket mapping published       │
-     │  to Supabase + localStorage           │
-     ├─ Shares PIN with receiver ──────────→ ├─ Enters 6-digit PIN
-     │                                      ├─ Engine looks up PIN in
-     │                                      │  Supabase / localStorage
-     │                                      ├─ Resolves connection ticket
-     │                                      ├─ Establishes P2P stream
-     │ ←────────── file chunks flow ────────┤
-     │                                      ├─ File downloads to device
-     └─ Transfer complete                   └─ Transfer complete
+     ├─ Clicks "Create a room"               │
+     ├─ Gets 6-digit code + QR               │
+     ├─ Shares code/QR ─────────────────────→ ├─ Enters code or scans QR
+     │                                      ├─ Joins the room
+     │ ←──── real-time chat (broadcast) ────┤
+     │ ←──── file chunks (Supabase) ────────┤
+     │                                      ├─ Downloads file
+     └─ Both can chat + share files          └─ Both can chat + share files
 ```
 
-### PIN-to-Ticket Mapping (Two Layers)
+### Step-by-step
 
-1. **localStorage** — for same-device transfers (sender and receiver in the same browser). Instant lookup, no network needed.
-2. **Supabase database** — for cross-device transfers. The `transfer_tickets` table stores the ephemeral PIN → ticket mapping. Rows auto-expire after 10 minutes. The table is publicly readable/writable (no sign-in required) via Supabase Row Level Security policies scoped to the `anon` role.
+1. **Create a room** — Click "Create a room" to get a 6-digit code and QR instantly. No sign-up needed.
+2. **Share the code** — Send the 6-digit code or QR to anyone. They enter it or scan to join your room.
+3. **Chat & connect** — Start chatting in real-time. See who's online and exchange messages instantly.
+4. **Share files** — Drag a file into the chat or click the + button. Others in the room can download it with one click.
 
-### P2P Transport (Iroh)
+### What you can share
 
-The transfer engine uses the official Iroh browser WebAssembly runtime for direct, encrypted QUIC connections between browsers. Iroh connections are end-to-end encrypted by default, even when relayed through a server (browsers can't send raw UDP packets, so browser-to-browser connections flow through Iroh's relay servers — but the relays can't decrypt the traffic).
+| Type | Formats |
+|------|---------|
+| Images | JPG, PNG, GIF, WebP, SVG |
+| Documents | PDF, Word, Excel, plain text |
+| Archives | ZIP, RAR, 7Z, tar.gz |
+| Code files | JS, TS, JSON, Python, more |
+| Any file | No type restrictions, up to ~50MB |
+| Real-time chat | Text messages with instant delivery |
 
-> **Note:** The Iroh browser WASM npm package (`@number0/iroh-browser`) is not yet published. The engine dynamically imports it when available and falls back to a simulation mode that exercises the exact same UI flow. When the package is published, real P2P transfers will activate automatically with no code changes needed.
+## Authentication (Optional)
+
+Meshdrop uses **Supabase Auth** for the optional sign-in feature. Authentication is never required — the app works fully without an account.
+
+### Why Supabase Auth (not Firebase)
+
+Since the app already uses Supabase for its database, realtime, and file relay, using Supabase Auth keeps everything in one platform:
+- **Single backend** — no need to manage a separate Firebase project alongside Supabase.
+- **Shared session** — the Supabase client handles auth state and database access with the same connection.
+- **RLS integration** — Row Level Security policies on the `user_room_history` table use `auth.uid()` to scope each user's history to their own account.
+- **No extra dependencies** — the `@supabase/supabase-js` client already handles auth; no Firebase SDK needed.
+
+### What sign-in gives you
+
+- **Room history** — signed-in users see a "Recent rooms" section on the landing page showing every room they've joined or created, with timestamps and role.
+- **Persistent logs** — your room participation is saved to the `user_room_history` table and tied to your account.
+- **Signed-in badge** — in the room sidebar, other signed-in users can see you're a verified member (shield icon). Guest users appear with a lock icon (only visible to signed-in users).
+
+### What stays the same for guests
+
+- Full chat and file sharing capabilities
+- Real-time presence and member list
+- Room creation and joining
+- No data stored — everything is ephemeral
 
 ## Tech Stack
 
@@ -50,9 +80,25 @@ The transfer engine uses the official Iroh browser WebAssembly runtime for direc
 | Build tool | Vite 5 |
 | Styling | Tailwind CSS + custom CSS |
 | Icons | Lucide React |
-| P2P transport | Iroh (WebAssembly, dynamic import) |
-| Ephemeral KV store | Supabase (`transfer_tickets` table, auto-expiring) |
-| Local storage | Browser LocalStorage (transfer history + PIN cache) |
+| Backend | Supabase (database, realtime, auth) |
+| Chat transport | Supabase Realtime broadcast channels |
+| File transport | Supabase `transfer_chunks` table (chunked base64 relay) |
+| Presence | Supabase `room_members` table + polling |
+| QR codes | qrcode.react |
+| QR scanning | jsqr |
+
+## Database Schema
+
+| Table | Purpose |
+|-------|---------|
+| `transfer_tickets` | Room registry — maps 6-digit PINs to active rooms with connection status |
+| `room_members` | Presence — tracks who's in each room, with `user_id` for signed-in users |
+| `transfer_chat` | Chat messages — text messages with sender name and optional `user_id` |
+| `transfer_chunks` | File data — files split into 256KB base64 chunks for reliable relay |
+| `file_offers` | File metadata — file name, size, type, upload status, chunk count |
+| `user_room_history` | Signed-in user history — rooms visited with timestamps (owner-scoped via RLS) |
+
+All tables have Row Level Security enabled. The transfer tables use `anon, authenticated` policies (public/shared ephemeral data). The `user_room_history` table uses `authenticated`-only policies scoped to `auth.uid() = user_id`.
 
 ## Getting Started
 
@@ -62,17 +108,6 @@ npm run dev
 ```
 
 Open your browser to the displayed URL.
-
-### Cross-Origin Isolation
-
-The dev server is configured with COOP and COEP headers:
-
-```
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp
-```
-
-These are required for `SharedArrayBuffer` support, which the Iroh WASM threading layer needs. If you deploy to a static host, make sure your hosting provider sets these headers (see deployment section below).
 
 ## Build
 
@@ -98,89 +133,52 @@ Secrets and variables → Actions**:
 The workflow passes these values into the Vite build and stops if either is
 missing. Never use the Supabase service-role key in a frontend deployment.
 
-**Critical:** Your hosting provider must serve the COOP/COEP headers for the Iroh WASM layer to function:
-
-```
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp
-```
-
-#### Netlify (`netlify.toml`)
-
-```toml
-[[headers]]
-  for = "/*"
-  [headers.values]
-    Cross-Origin-Opener-Policy = "same-origin"
-    Cross-Origin-Embedder-Policy = "require-corp"
-```
-
-#### Vercel (`vercel.json`)
-
-```json
-{
-  "headers": [
-    {
-      "source": "/(.*)",
-      "headers": [
-        { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" },
-        { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" }
-      ]
-    }
-  ]
-}
-```
-
-#### Cloudflare Pages
-
-Add these as custom headers in the Pages dashboard or via a `_headers` file:
-
-```
-/*
-  Cross-Origin-Opener-Policy: same-origin
-  Cross-Origin-Embedder-Policy: require-corp
-```
-
-> Without these headers, the simulation fallback still works, but real Iroh P2P transfers will be blocked by the browser's security sandbox.
-
 ## Project Structure
 
 ```
 src/
-├── App.tsx              # Main UI: send/receive tabs, metrics, history
+├── App.tsx              # Main UI: landing page, room screen, auth modal
 ├── lib/
-│   └── transfer.ts      # P2P engine: Iroh + Supabase + simulation fallback
+│   └── transfer.ts      # Room engine: Supabase realtime, chat, file relay, auth
+├── components/
+│   └── QrScanner.tsx    # QR code camera scanner
 ├── index.css            # Global styles + Tailwind
 └── main.tsx             # React entry point
-vite.config.ts           # Vite config with COOP/COEP headers
+supabase/
+└── migrations/          # Database migration SQL files
+vite.config.ts           # Vite config
 ```
 
-## Transfer States
+## How the Sign-In Flow Works
 
-The UI cycles through these connection states:
-
-| State | Description |
-|-------|-------------|
-| Idle | No transfer in progress |
-| Hashing File | Sender's file is being prepared |
-| Waiting for Peer... | Sender has published the PIN, waiting for receiver to connect |
-| Actively Streaming Data | File chunks are flowing between peers |
-| Transfer Complete | Transfer finished, file ready for download |
+1. User clicks "Sign in" or "Create account" on the landing page.
+2. A modal opens with email/password fields (Supabase Auth, email confirmation OFF).
+3. On success, `onAuthStateChange` fires and updates the app's user state.
+4. If signed in, the landing page shows a "Recent rooms" section with the user's history.
+5. When creating or joining a room, a row is inserted into `user_room_history` with the user's ID, room PIN, display name, and role.
+6. When leaving a room, the `left_at` timestamp is recorded.
+7. In the room sidebar, signed-in users see shield badges next to other signed-in members, and lock icons next to guest members. Guest users don't see badges.
 
 ## Troubleshooting
 
-**"No active transfer found for that PIN"**
-- Make sure the sender has selected a file and their pairing code is displayed
-- The code expires after 10 minutes — ask the sender to re-select the file
-- For cross-device transfers, both devices need internet connectivity to reach the Supabase database
-- The receiver polls for up to 15 seconds — if the sender's network is slow, the PIN may not have synced yet
+**"No active room found for that code"**
+- Make sure the host has created the room and their code is displayed
+- The code expires after 10 minutes — ask the host to create a new room
+- Both devices need internet connectivity to reach the Supabase database
+
+**Messages not appearing from the other person**
+- Both devices must be in the same room (same 6-digit code)
+- Check that the network status pill shows "Network online"
+- Realtime broadcast requires an active Supabase connection
 
 **File download doesn't start**
-- Check that the transfer state shows "Transfer Complete"
-- The download button appears at the bottom of the transfer card after completion
+- Wait for the upload progress to reach 100% and show "Ready to download"
+- The download button only appears for users who didn't upload the file
 
-**Build warnings about browserslist**
-- Run `npx update-browserslist-db@latest` to clear the warning (cosmetic only)
+**Sign-in not working**
+- Make sure your Supabase project has email/password auth enabled (it's on by default)
+- Email confirmation is OFF — users can sign in immediately after signing up
+- Check the browser console for Supabase auth errors
 
 ## License
 
